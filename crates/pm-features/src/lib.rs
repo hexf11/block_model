@@ -6,3 +6,4 @@ pub mod trades;
 pub mod book;
 pub mod types;
 pub mod snapshot;
+pub mod features;

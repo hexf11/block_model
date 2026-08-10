@@ -155,10 +155,12 @@ impl SnapshotBuilder {
                 .or_else(|| row["obs_ms"].as_i64())
                 .with_context(|| format!("obs_ms 解析失败: {row}"))?;
 
-            let price_str = row["price"]
-                .as_str()
-                .with_context(|| format!("price 字段缺失: {row}"))?;
-            let price = Decimal::from_str(price_str)
+            let price_str = match &row["price"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                other => anyhow::bail!("price 字段格式意外: {other}"),
+            };
+            let price = Decimal::from_str(&price_str)
                 .with_context(|| format!("price 解析失败: {price_str}"))?;
 
             // 双重检查：永远不允许未来数据混入
