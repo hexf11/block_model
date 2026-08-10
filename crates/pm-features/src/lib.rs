@@ -5,3 +5,4 @@ pub mod bbo;
 pub mod trades;
 pub mod book;
 pub mod types;
+pub mod snapshot;
