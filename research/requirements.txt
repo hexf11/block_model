@@ -1,0 +1,20 @@
+# Offline training only — never runs in production.
+# Reads features from ClickHouse, trains, exports ONNX to ../models/
+
+clickhouse-driver==0.2.9
+pandas==2.2.3
+numpy==2.2.1
+lightgbm==4.5.0
+scikit-learn==1.6.1
+optuna==4.1.0
+shap==0.46.0
+
+# LightGBM -> ONNX export
+onnxmltools==1.12.0
+skl2onnx==1.18.0
+onnx==1.17.0
+
+# Notebooks
+jupyterlab==4.3.4
+matplotlib==3.10.0
+python-dotenv==1.0.1

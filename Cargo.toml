@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/pm-collector",
+    "crates/pm-features",
+    "crates/pm-inference",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["block_model"]
+license     = "MIT"
+
+# ── shared dependency versions ─────────────────────────────────────────────
+[workspace.dependencies]
+# async runtime
+tokio            = { version = "1.53",  features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+
+# serialization
+serde            = { version = "1",     features = ["derive"] }
+serde_json       = { version = "1" }
+
+# ClickHouse
+clickhouse       = { version = "0.15" }
+
+# HTTP server (inference service)
+axum             = { version = "0.8" }
+
+# Feature engineering / numerics
+polars           = { version = "0.55",  features = ["lazy"] }
+
+# ONNX inference
+ort              = { version = "2.0.0-rc.13", features = ["download-binaries"] }
+
+# Config / env
+dotenvy          = { version = "0.15" }
+config           = { version = "0.15" }
+
+# Logging / tracing
+tracing          = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow           = { version = "1" }
+thiserror        = { version = "2" }
+
+# Time
+chrono           = { version = "0.4", features = ["serde"] }
+
+# Numeric precision
+rust_decimal     = { version = "1", features = ["serde-float"] }

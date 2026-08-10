@@ -1,0 +1,31 @@
+[package]
+name    = "pm-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# HTTP inference service.
+# Loads ONNX model from models/ at startup.
+# POST /predict  → { up_prob, down_prob }
+# Called by the external executor project at T-110s.
+
+[[bin]]
+name = "inference"
+path = "src/main.rs"
+
+[dependencies]
+pm-features      = { path = "../pm-features" }
+
+tokio            = { workspace = true }
+axum             = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+clickhouse       = { workspace = true }
+ort              = { workspace = true }
+dotenvy          = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow           = { workspace = true }
+thiserror        = { workspace = true }
+chrono           = { workspace = true }
+rust_decimal     = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name    = "pm-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Library only — shared by pm-inference (realtime) and the offline
+# feature-snapshot job (training data). Single source of truth for
+# feature computation to avoid train/serve skew.
+
+[dependencies]
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+chrono       = { workspace = true }
+rust_decimal = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
