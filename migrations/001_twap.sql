@@ -33,13 +33,15 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY ts_ms;
 
--- 每个 symbol 的最新 TWAP
+-- 每个 symbol 的最新 TWAP。
+-- 用表别名 t.obs_ms 显式引用列，避免 ClickHouse 把 SELECT 里的
+-- "obs_ms" alias 解析进 argMax 的第二参数造成嵌套聚合报错。
 CREATE VIEW IF NOT EXISTS pm.twap_latest AS
 SELECT
     symbol,
     window_s,
-    argMax(price,  obs_ms) AS price,
-    argMax(obs_ms, obs_ms) AS obs_ms,
-    argMax(recv_ms, obs_ms) AS recv_ms
-FROM pm.twap
+    argMax(price,    t.obs_ms) AS price,
+    argMax(recv_ms,  t.obs_ms) AS recv_ms,
+    max(t.obs_ms)              AS obs_ms
+FROM pm.twap AS t
 GROUP BY symbol, window_s;

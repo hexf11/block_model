@@ -1,0 +1,11 @@
+<!-- 覆盖官方镜像的 default-user.xml，去掉 IP 白名单限制。
+     主机侧端口已绑定在 127.0.0.1，不会暴露到局域网。 -->
+<clickhouse>
+  <users>
+    <default>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>

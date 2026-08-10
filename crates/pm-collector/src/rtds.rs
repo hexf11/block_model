@@ -97,6 +97,8 @@ async fn run_session(cfg: &Config) -> Result<String> {
                     Message::Text(t) => {
                         last_msg = Instant::now();
                         if t.as_str() == "PONG" { continue; }
+                        // 服务端偶尔发空帧或纯空白帧，忽略即可
+                        if t.as_str().trim().is_empty() { continue; }
                         msgs += 1;
                         if let Some(rec) = parse_frame(t.as_str(), now_ms()) {
                             // JSONL：所有 symbol，无条件写入
