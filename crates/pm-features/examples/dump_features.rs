@@ -5,6 +5,9 @@
 //!
 //! 输出每个 symbol 在 T-110s 预测时点的完整特征向量，
 //! 用于人工检查是否有 NAN 泛滥、量级异常等问题。
+//!
+//! build_all() 在同一个 snap_ms 下批量构建所有 symbol 的快照，
+//! 并注入共享的 USDT/USD 溢价，确保 FX 剥离逻辑与推理路径一致。
 
 use pm_features::features::{compute_features, FEATURE_NAMES};
 use pm_features::snapshot::SnapshotBuilder;
@@ -27,17 +30,26 @@ fn main() -> anyhow::Result<()> {
             .map(|d| d.format("%H:%M:%S").to_string())
             .unwrap_or_default());
 
-    for symbol in SYMBOLS {
-        let snap = builder.build(symbol, snap_ms)?;
-        let fv = compute_features(&snap);
+    // build_all() 共享一次 USDT/USD 溢价估算，注入所有 snapshot
+    let snaps = builder.build_all(&SYMBOLS, snap_ms)?;
 
-        println!("── {symbol} ──  ticks={}  open={:?}  current={:?}",
-            snap.tick_count(), snap.open_price(), snap.current_price());
+    // 打印估算到的 FX 溢价（取第一个有值的 snapshot）
+    if let Some(premium) = snaps.first().and_then(|s| s.fx_usdt_premium) {
+        println!("USDT/USD 溢价: {:.4}bp\n", premium * 10_000.0);
+    } else {
+        println!("USDT/USD 溢价: 未能估算（可能数据不足）\n");
+    }
+
+    for snap in &snaps {
+        let fv = compute_features(snap);
+
+        println!("── {} ──  ticks={}  open={:?}  current={:?}",
+            snap.symbol, snap.tick_count(), snap.open_price(), snap.current_price());
 
         let mut nan_count = 0;
         for (name, val) in FEATURE_NAMES.iter().zip(fv.features.iter()) {
             if val.is_nan() { nan_count += 1; }
-            println!("  {name:<16} {val:>14.8}");
+            println!("  {name:<20} {val:>14.8}");
         }
         if nan_count > 0 {
             println!("  ⚠️  {nan_count} 个特征为 NAN");

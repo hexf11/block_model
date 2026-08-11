@@ -89,20 +89,44 @@ pub struct TradeTick {
     pub is_buy:   bool,
 }
 
+/// 判断交易所是否以真实 USD 计价（coinbase/kraken 是 USD，其余是 USDT）
+fn is_usd_quoted(exchange: &str) -> bool {
+    matches!(exchange, "coinbase" | "kraken")
+}
+
+/// 简单线性回归斜率 dy/dx。至少需要 2 个点；所有 x 相同时返回 NAN。
+fn linreg_slope(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len() as f64;
+    if n < 2.0 { return f64::NAN; }
+    let sx: f64 = xs.iter().sum();
+    let sy: f64 = ys.iter().sum();
+    let sxx: f64 = xs.iter().map(|x| x * x).sum();
+    let sxy: f64 = xs.iter().zip(ys.iter()).map(|(x, y)| x * y).sum();
+    let denom = n * sxx - sx * sx;
+    if denom.abs() < 1e-10 { return f64::NAN; }
+    (n * sxy - sx * sy) / denom
+}
+
 /// 给定 symbol + snap_ms 的完整快照
 #[derive(Debug, Clone)]
 pub struct WindowSnapshot {
     /// 预测时刻（毫秒 Unix）
-    pub snap_ms:     i64,
-    pub symbol:      String,
+    pub snap_ms:      i64,
+    pub symbol:       String,
     /// 本市场窗口开始时间（5 分钟对齐）
     pub win_start_ms: i64,
     /// 窗口内所有 TWAP tick，obs_ms <= snap_ms，按 obs_ms 升序
-    pub twap_ticks:  Vec<TwapTick>,
+    pub twap_ticks:   Vec<TwapTick>,
     /// 窗口内所有交易所 BBO，recv_ms <= snap_ms，按 recv_ms 升序
-    pub bbo_ticks:   Vec<BboTick>,
+    pub bbo_ticks:    Vec<BboTick>,
     /// 窗口内所有成交，recv_ms <= snap_ms，按 recv_ms 升序
-    pub trade_ticks: Vec<TradeTick>,
+    pub trade_ticks:  Vec<TradeTick>,
+    /// USDT/USD 溢价（由 build_all 注入）。
+    ///
+    /// 实测稳定在 ~9.7bp：binance/okx/bybit 以 USDT 计价，coinbase/kraken 以真实
+    /// USD 计价，两组的中间价比值就是 USDT/USD 现汇率偏差。
+    /// `None` 表示单 symbol 构建路径，FX 敏感特征会退化为 NAN。
+    pub fx_usdt_premium: Option<f64>,
 }
 
 impl WindowSnapshot {
@@ -351,6 +375,297 @@ impl WindowSnapshot {
     pub fn active_exchange_count(&self) -> usize {
         self.latest_bbo_per_exchange().len()
     }
+
+    // ── FX 剥离后的现货价格 ──────────────────────────────────────────────────
+
+    /// 去掉 USDT/USD 溢价后的共识中间价（USD 口径）。
+    ///
+    /// USD 计价交易所（coinbase/kraken）直接使用；USDT 计价的三家除以 (1 + fx_usdt_premium)。
+    /// fx_usdt_premium 为 None 时退化为普通 `consensus_mid()`（含 ~9bp 偏移）。
+    pub fn consensus_mid_usd(&self) -> Option<f64> {
+        let premium = self.fx_usdt_premium.unwrap_or(0.0);
+        let mut mids: Vec<f64> = self.latest_bbo_per_exchange()
+            .iter()
+            .map(|t| {
+                let raw = t.mid();
+                if is_usd_quoted(&t.exchange) { raw } else { raw / (1.0 + premium) }
+            })
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .collect();
+        if mids.is_empty() { return None; }
+        mids.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = mids.len();
+        Some(if n % 2 == 1 { mids[n / 2] } else { (mids[n / 2 - 1] + mids[n / 2]) / 2.0 })
+    }
+
+    /// 现货（USD 口径）相对开盘价的收益率：(spot_usd - open) / open。
+    ///
+    /// 与 `ret_so_far`（TWAP-based）相比：TWAP 此时是 [T+160, T+190] 的均值，
+    /// 天然滞后 15 秒；而现货直接反映 T+190 时刻，对 label 的预测力更强。
+    pub fn spot_ret_from_open(&self) -> Option<f64> {
+        let spot = self.consensus_mid_usd()?;
+        let open: f64 = self.open_price()?.try_into().ok()?;
+        if open <= 0.0 { return None; }
+        Some((spot - open) / open)
+    }
+
+    /// 现货（USD 口径）的归一化距离：(spot_usd - open) / (σ · √t_remaining)。
+    ///
+    /// `norm_dist` 的严格更优版本：分子用现货而非 twap_now，更接近 label 的真实结构。
+    /// fx_usdt_premium 为 None 时退化为含偏移的估计（仍有信号，但量纲有偏）。
+    pub fn spot_norm_dist(&self) -> Option<f64> {
+        let spot = self.consensus_mid_usd()?;
+        let open: f64 = self.open_price()?.try_into().ok()?;
+        let sigma = self.price_std()?;
+        if sigma == 0.0 { return None; }
+        let t_rem = self.remaining_ms() as f64 / 1000.0;
+        if t_rem <= 0.0 { return None; }
+        Some((spot - open) / (sigma * t_rem.sqrt()))
+    }
+
+    /// TWAP 向现货收敛的待吸收缺口，归一化：(spot_usd - twap_now) / (σ · √t_remaining)。
+    ///
+    /// TWAP-30 在数学上必须向现货靠拢，这个值正比于"还有多少路要赶"。
+    pub fn twap_spot_gap_norm(&self) -> Option<f64> {
+        let spot = self.consensus_mid_usd()?;
+        let twap: f64 = self.current_price()?.try_into().ok()?;
+        let sigma = self.price_std()?;
+        if sigma == 0.0 || twap <= 0.0 { return None; }
+        let t_rem = self.remaining_ms() as f64 / 1000.0;
+        if t_rem <= 0.0 { return None; }
+        Some((spot - twap) / (sigma * t_rem.sqrt()))
+    }
+
+    // ── Basis 趋势 ────────────────────────────────────────────────────────────
+
+    /// 带时间戳的 basis 序列（recv_ms, basis_value）。
+    ///
+    /// 与 `basis_series()` 逻辑相同，但额外返回每条 BBO 的 recv_ms，
+    /// 供斜率计算使用。
+    fn basis_series_timed(&self) -> Vec<(i64, f64)> {
+        if self.twap_ticks.is_empty() { return Vec::new(); }
+        let mut out = Vec::with_capacity(self.bbo_ticks.len());
+        let mut ti = 0usize;
+        for b in &self.bbo_ticks {
+            while ti + 1 < self.twap_ticks.len()
+                && self.twap_ticks[ti + 1].obs_ms <= b.recv_ms
+            {
+                ti += 1;
+            }
+            if self.twap_ticks[ti].obs_ms > b.recv_ms { continue; }
+            let twap: f64 = match self.twap_ticks[ti].price.try_into() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if twap <= 0.0 { continue; }
+            let mid = b.mid();
+            if !mid.is_finite() || mid <= 0.0 { continue; }
+            out.push((b.recv_ms, (mid - twap) / twap));
+        }
+        out
+    }
+
+    /// 指定时间窗内 basis 的线性斜率（bp/秒，归一化单位）。
+    ///
+    /// 正值：basis 在扩大（现货正在远离 TWAP）→ 待吸收漂移还在积累。
+    /// 负值：basis 在收缩（TWAP 正在追上现货）→ 信号趋弱。
+    pub fn basis_slope(&self, window_ms: i64) -> Option<f64> {
+        let cutoff = self.snap_ms - window_ms;
+        let series: Vec<(f64, f64)> = self.basis_series_timed()
+            .into_iter()
+            .filter(|(t, _)| *t >= cutoff)
+            .map(|(t, b)| (t as f64 / 1000.0, b))
+            .collect();
+        if series.len() < 5 { return None; }
+        let xs: Vec<f64> = series.iter().map(|(t, _)| *t).collect();
+        let ys: Vec<f64> = series.iter().map(|(_, b)| *b).collect();
+        let s = linreg_slope(&xs, &ys);
+        if s.is_nan() { None } else { Some(s) }
+    }
+
+    // ── OFI（订单流失衡） ─────────────────────────────────────────────────────
+
+    /// 指定时间窗内各交易所的 OFI，返回 (exchange, ofi_raw, abs_flow)。
+    fn ofi_by_exchange(&self, window_ms: i64) -> Vec<(&str, f64, f64)> {
+        let cutoff = self.snap_ms - window_ms;
+        // 按交易所名收集有序 tick（bbo_ticks 已按 recv_ms 升序）
+        let mut result = Vec::new();
+
+        let mut ex_list: Vec<&str> = Vec::new();
+        for t in &self.bbo_ticks {
+            if !ex_list.contains(&t.exchange.as_str()) {
+                ex_list.push(t.exchange.as_str());
+            }
+        }
+
+        for ex in ex_list {
+            let ticks: Vec<&BboTick> = self.bbo_ticks.iter()
+                .filter(|t| t.exchange.as_str() == ex)
+                .collect();
+            if ticks.len() < 2 { continue; }
+
+            // 锚点：cutoff 之前最后一条（index = partition_point - 1）
+            let anchor = ticks.partition_point(|t| t.recv_ms < cutoff);
+            if anchor == 0 { continue; }
+            let start = anchor - 1;
+
+            let mut ofi_raw: f64 = 0.0;
+            let mut abs_flow: f64 = 0.0;
+            for i in (start + 1)..ticks.len() {
+                let prev = ticks[i - 1];
+                let cur  = ticks[i];
+                if cur.recv_ms < cutoff { continue; }
+                if cur.recv_ms > self.snap_ms { break; }
+
+                let e_b = if cur.bid > prev.bid + 1e-10 {
+                    cur.bid_qty
+                } else if (cur.bid - prev.bid).abs() <= 1e-10 {
+                    (cur.bid_qty - prev.bid_qty).max(0.0)
+                } else {
+                    -prev.bid_qty
+                };
+                let e_a = if cur.ask < prev.ask - 1e-10 {
+                    cur.ask_qty
+                } else if (cur.ask - prev.ask).abs() <= 1e-10 {
+                    (cur.ask_qty - prev.ask_qty).max(0.0)
+                } else {
+                    -prev.ask_qty
+                };
+                ofi_raw  += e_b - e_a;
+                abs_flow += e_b.abs() + e_a.abs();
+            }
+            if abs_flow > 0.0 {
+                result.push((ex, ofi_raw, abs_flow));
+            }
+        }
+        result
+    }
+
+    /// 汇总 OFI：`Σ(ofi_raw) / Σ(abs_flow)`，范围约 [-1, 1]，跨 symbol 可比。
+    ///
+    /// 正值：净买压；负值：净卖压。
+    pub fn ofi(&self, window_ms: i64) -> Option<f64> {
+        let data = self.ofi_by_exchange(window_ms);
+        if data.is_empty() { return None; }
+        let total_ofi: f64  = data.iter().map(|(_, o, _)| o).sum();
+        let total_abs: f64  = data.iter().map(|(_, _, a)| a).sum();
+        if total_abs <= 0.0 { return None; }
+        Some(total_ofi / total_abs)
+    }
+
+    /// OFI 方向一致性：OFI 同号（净买）的交易所占比。
+    ///
+    /// 五家一致的信号可信度远高于单家。
+    pub fn ofi_agreement(&self, window_ms: i64) -> Option<f64> {
+        let data = self.ofi_by_exchange(window_ms);
+        if data.is_empty() { return None; }
+        let n_pos = data.iter().filter(|(_, o, _)| *o > 0.0).count();
+        Some(n_pos as f64 / data.len() as f64)
+    }
+
+    // ── 成交流高级特征 ────────────────────────────────────────────────────────
+
+    /// 大单方向失衡：只计 qty >= P75 的成交，其余忽略。
+    ///
+    /// aggTrade 已经把同毫秒同价格的 taker 单合并，大 qty 近似等于机构单。
+    pub fn large_flow_imbalance(&self, window_ms: i64) -> Option<f64> {
+        let trades: Vec<&TradeTick> = self.trades_in_last(window_ms).collect();
+        if trades.len() < 4 { return None; }
+
+        let mut qtys: Vec<f64> = trades.iter().map(|t| t.qty).collect();
+        qtys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p75 = qtys[qtys.len() * 3 / 4];
+
+        let (buy, sell) = trades.iter()
+            .filter(|t| t.qty >= p75)
+            .fold((0.0f64, 0.0f64), |(b, s), t| {
+                if t.is_buy { (b + t.qty, s) } else { (b, s + t.qty) }
+            });
+        let total = buy + sell;
+        if total <= 0.0 { None } else { Some((buy - sell) / total) }
+    }
+
+    /// 近期成交 VWAP 相对开盘价的偏离：(vwap - open) / open。
+    ///
+    /// 比 BBO 中点噪声更小，天然按成交量加权。
+    pub fn vwap_dev(&self, window_ms: i64) -> Option<f64> {
+        let (sum_pv, sum_v) = self.trades_in_last(window_ms)
+            .fold((0.0f64, 0.0f64), |(spv, sv), t| {
+                (spv + t.price * t.qty, sv + t.qty)
+            });
+        if sum_v <= 0.0 { return None; }
+        let vwap = sum_pv / sum_v;
+        let open: f64 = self.open_price()?.try_into().ok()?;
+        if open <= 0.0 { return None; }
+        Some((vwap - open) / open)
+    }
+
+    // ── 波动率辅助 ────────────────────────────────────────────────────────────
+
+    /// 指定时间窗内 TWAP 价格序列的标准差。
+    pub fn price_std_last(&self, window_ms: i64) -> Option<f64> {
+        let cutoff = self.snap_ms - window_ms;
+        let prices: Vec<f64> = self.twap_ticks.iter()
+            .filter(|t| t.obs_ms >= cutoff)
+            .map(|t| t.price.try_into().unwrap_or(f64::NAN))
+            .filter(|p| p.is_finite())
+            .collect();
+        let n = prices.len();
+        if n < 2 { return None; }
+        let mean = prices.iter().sum::<f64>() / n as f64;
+        let var  = prices.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+        Some(var.sqrt())
+    }
+
+    /// 近期波动率与全窗口波动率之比：σ_60s / σ_full。
+    ///
+    /// >1 说明近期波动加速（突破前沿）；<1 说明在收敛（反转风险上升）。
+    pub fn vol_ratio(&self) -> Option<f64> {
+        let sigma_recent = self.price_std_last(60_000)?;
+        let sigma_full   = self.price_std()?;
+        if sigma_full <= 0.0 { return None; }
+        Some(sigma_recent / sigma_full)
+    }
+
+    /// 现货（BBO 中点）近 60s 的已实现波动率 / 开盘价。
+    ///
+    /// TWAP 波动被 30s 均值平滑，不能反映高频波动；现货 BBO 的标准差更贴近
+    /// 真实价格不确定性，也更接近 label 的实际波动性质。
+    pub fn spot_vol_rel(&self) -> Option<f64> {
+        let cutoff = self.snap_ms - 60_000;
+        let mids: Vec<f64> = self.bbo_ticks.iter()
+            .filter(|t| t.recv_ms >= cutoff)
+            .map(|t| t.mid())
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .collect();
+        let n = mids.len();
+        if n < 5 { return None; }
+        let mean = mids.iter().sum::<f64>() / n as f64;
+        if mean <= 0.0 { return None; }
+        let var = mids.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+        Some(var.sqrt() / mean)
+    }
+
+    // ── 现货动量 ──────────────────────────────────────────────────────────────
+
+    /// 现货 BBO 中点在指定时间窗内的线性斜率，归一化为相对斜率（/秒 / open）。
+    ///
+    /// 比 TWAP 斜率领先 ~15s，用于捕捉现货动量变化。
+    pub fn spot_slope(&self, window_ms: i64) -> Option<f64> {
+        let cutoff = self.snap_ms - window_ms;
+        let points: Vec<(f64, f64)> = self.bbo_ticks.iter()
+            .filter(|t| t.recv_ms >= cutoff)
+            .map(|t| (t.recv_ms as f64 / 1000.0, t.mid()))
+            .filter(|(_, m)| m.is_finite() && *m > 0.0)
+            .collect();
+        if points.len() < 5 { return None; }
+        let xs: Vec<f64> = points.iter().map(|(t, _)| *t).collect();
+        let ys: Vec<f64> = points.iter().map(|(_, m)| *m).collect();
+        let open: f64 = self.open_price()?.try_into().ok()?;
+        if open <= 0.0 { return None; }
+        let s = linreg_slope(&xs, &ys);
+        if s.is_nan() { None } else { Some(s / open) }
+    }
 }
 
 // ── 快照构建器 ────────────────────────────────────────────────────────────────
@@ -424,6 +739,7 @@ impl SnapshotBuilder {
             twap_ticks: ticks,
             bbo_ticks,
             trade_ticks,
+            fx_usdt_premium: None,
         })
     }
 
@@ -519,6 +835,68 @@ impl SnapshotBuilder {
         }
         Ok(out)
     }
+
+    // ── FX stripping ──────────────────────────────────────────────────────────
+
+    /// 估算当前时刻的 USDT/USD 溢价。
+    ///
+    /// 方法：对每个 symbol，分别取 USDT 计价（binance/okx/bybit）和 USD 计价
+    /// （coinbase/kraken）的最新 BBO 中点，算每个 symbol 的比值，返回跨 symbol 中位数。
+    ///
+    /// 中位数比均值更鲁棒：某个 symbol 出现巨幅行情时，其 USDT/USD 比值会因
+    /// 两组价格对行情的反应速度不同而短暂偏离，中位数抑制这类噪声。
+    ///
+    /// 返回值约为 0.00097（~+9.7bp）。如果数据不足或结果明显异常，返回 None。
+    pub fn estimate_usdt_premium(&self, snap_ms: i64) -> Option<f64> {
+        let win_start_ms = (snap_ms / 300_000) * 300_000;
+        // 在窗口内（非仅最新一秒）取最新值，和 build() 数据口径一致
+        let sql = format!(
+            "WITH latest AS ( \
+               SELECT exchange, symbol, \
+                 argMax((toFloat64(bid)+toFloat64(ask))/2, recv_ms) AS mid \
+               FROM pm.ex_bbo \
+               WHERE recv_ms >= {win_start_ms} AND recv_ms <= {snap_ms} \
+               GROUP BY exchange, symbol \
+             ), per_sym AS ( \
+               SELECT symbol, \
+                 medianIf(mid, exchange IN ('binance','okx','bybit')) AS usdt_mid, \
+                 medianIf(mid, exchange IN ('coinbase','kraken')) AS usd_mid \
+               FROM latest GROUP BY symbol \
+               HAVING usdt_mid > 0 AND usd_mid > 0 \
+             ) \
+             SELECT median(usdt_mid / usd_mid - 1) AS premium \
+             FROM per_sym \
+             FORMAT JSONEachRow"
+        );
+        let rows = ch_query_raw(&self.ch_url, &sql).ok()?;
+        let row  = rows.into_iter().next()?;
+        let premium = match &row["premium"] {
+            serde_json::Value::String(s) => s.parse::<f64>().ok()?,
+            serde_json::Value::Number(n) => n.as_f64()?,
+            _ => return None,
+        };
+        // 合理性检查：0.03bp ~ 50bp
+        if premium.is_finite() && premium > 0.000003 && premium < 0.005 {
+            Some(premium)
+        } else {
+            None
+        }
+    }
+
+    /// 同时构建多个 symbol 的快照，并注入共享的 FX 溢价估算。
+    ///
+    /// 这是训练和推理的推荐入口：FX 溢价只需估算一次（每个 snap_ms），
+    /// 每个 snapshot 获得相同的 fx_usdt_premium，从而可以使用 FX 敏感特征。
+    pub fn build_all(&self, symbols: &[&str], snap_ms: i64) -> Result<Vec<WindowSnapshot>> {
+        let fx_premium = self.estimate_usdt_premium(snap_ms);
+        symbols.iter()
+            .map(|sym| {
+                let mut snap = self.build(sym, snap_ms)?;
+                snap.fx_usdt_premium = fx_premium;
+                Ok(snap)
+            })
+            .collect()
+    }
 }
 
 /// 从 JSON 值取 i64 —— ClickHouse 的 UInt64 序列化为字符串，其余为数字
@@ -548,8 +926,9 @@ mod tests {
             symbol: "btc/usd".to_string(),
             win_start_ms,
             twap_ticks: ticks.into_iter().map(|(obs_ms, price)| TwapTick { obs_ms, price }).collect(),
-            bbo_ticks:   Vec::new(),
-            trade_ticks: Vec::new(),
+            bbo_ticks:        Vec::new(),
+            trade_ticks:      Vec::new(),
+            fx_usdt_premium:  None,
         }
     }
 

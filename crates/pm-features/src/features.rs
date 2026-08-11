@@ -46,6 +46,18 @@ fn slope_per_sec(xs: &[f64], ys: &[f64]) -> f64 {
 
 // ── 公共接口 ──────────────────────────────────────────────────────────────────
 
+/// symbol → 整数编号（pooled 模型的 categorical 特征）
+fn symbol_id(sym: &str) -> f64 {
+    match sym {
+        "btc/usd"  => 0.0,
+        "eth/usd"  => 1.0,
+        "sol/usd"  => 2.0,
+        "xrp/usd"  => 3.0,
+        "doge/usd" => 4.0,
+        _          => -1.0,
+    }
+}
+
 /// 从快照计算完整特征向量。
 /// 向量维度固定为 `FEATURE_COUNT`，顺序与 `FEATURE_NAMES` 对应。
 pub fn compute_features(snap: &WindowSnapshot) -> FeatureVector {
@@ -57,61 +69,74 @@ pub fn compute_features(snap: &WindowSnapshot) -> FeatureVector {
     let current: f64 = snap.current_price()
         .and_then(|p| p.try_into().ok())
         .unwrap_or(f64::NAN);
-    let elapsed_s  = snap.elapsed_ms()   as f64 / 1000.0;
-    let _remaining_s = snap.remaining_ms() as f64 / 1000.0;
+    let elapsed_s = snap.elapsed_ms() as f64 / 1000.0;
 
-    // ── A. 位置类 ─────────────────────────────────────────────────────────────
+    // ── A. 垫子类 ─────────────────────────────────────────────────────────────
 
-    // A1: 窗口内收益率 (current - open) / open，反映已走过的幅度
-    let ret_so_far = if open.is_nan() || open == 0.0 {
-        f64::NAN
-    } else {
-        (current - open) / open
-    };
+    // A1: TWAP 窗口内总收益率
+    let ret_so_far = if open.is_nan() || open == 0.0 { f64::NAN }
+                    else { (current - open) / open };
     features.push(ret_so_far);
 
-    // A2: 价格在窗口内最高 / 最低之间的位置（0 = 最低，1 = 最高）
-    let (lo, hi) = snap.twap_ticks.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| {
-        let p: f64 = t.price.try_into().unwrap_or(f64::NAN);
-        (lo.min(p), hi.max(p))
-    });
-    let price_position = if (hi - lo).abs() < 1e-10 || lo.is_infinite() {
-        f64::NAN
-    } else {
-        (current - lo) / (hi - lo)
-    };
+    // A2: TWAP 价格在窗口内最高/最低之间的位置 [0,1]
+    let (lo, hi) = snap.twap_ticks.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(lo, hi), t| {
+            let p: f64 = t.price.try_into().unwrap_or(f64::NAN);
+            (lo.min(p), hi.max(p))
+        },
+    );
+    let price_position = if (hi - lo).abs() < 1e-10 || lo.is_infinite() { f64::NAN }
+                         else { (current - lo) / (hi - lo) };
     features.push(price_position);
 
-    // A3: 距窗口最高价的归一化偏差
-    let dist_from_hi = if hi.is_infinite() || open == 0.0 {
-        f64::NAN
-    } else {
-        (hi - current) / open
-    };
-    features.push(dist_from_hi);
+    // A3: 现货（FX 剥离）相对开盘价收益率
+    features.push(snap.spot_ret_from_open().unwrap_or(f64::NAN));
 
-    // A4: 距窗口最低价的归一化偏差
-    let dist_from_lo = if lo.is_infinite() || open == 0.0 {
-        f64::NAN
-    } else {
-        (current - lo) / open
-    };
-    features.push(dist_from_lo);
+    // A4: TWAP 归一化距离 = (twap_now - open) / (σ·√t_rem)
+    features.push(snap.normalized_distance().unwrap_or(f64::NAN));
 
-    // ── B. 动量类 ─────────────────────────────────────────────────────────────
+    // A5: 现货归一化距离（FX 剥离后，旗舰特征）
+    features.push(snap.spot_norm_dist().unwrap_or(f64::NAN));
 
-    // B1-B3: 最近 30s / 60s / 90s 的简单收益率
-    for lookback_ms in [30_000_i64, 60_000, 90_000] {
-        let past = price_n_ms_ago(snap, lookback_ms);
-        let ret = if past.is_nan() || past == 0.0 || current.is_nan() {
-            f64::NAN
-        } else {
-            (current - past) / past
-        };
-        features.push(ret);
-    }
+    // ── B. TWAP-现货缺口 ──────────────────────────────────────────────────────
 
-    // B4: 全窗口线性斜率（每秒收益率）
+    // B1: 基差相对窗口内均值的偏离
+    features.push(snap.spot_basis_dev().unwrap_or(f64::NAN));
+
+    // B2: 同一偏离 / 窗口内标准差
+    features.push(snap.spot_basis_dev_z().unwrap_or(f64::NAN));
+
+    // B3-B4: basis 近 30s / 60s 线性斜率
+    features.push(snap.basis_slope(30_000).unwrap_or(f64::NAN));
+    features.push(snap.basis_slope(60_000).unwrap_or(f64::NAN));
+
+    // B5: 待吸收 TWAP 缺口，归一化
+    features.push(snap.twap_spot_gap_norm().unwrap_or(f64::NAN));
+
+    // ── C. 订单流 ─────────────────────────────────────────────────────────────
+
+    // C1-C3: OFI 近 10s / 30s / 60s
+    features.push(snap.ofi(10_000).unwrap_or(f64::NAN));
+    features.push(snap.ofi(30_000).unwrap_or(f64::NAN));
+    features.push(snap.ofi(60_000).unwrap_or(f64::NAN));
+
+    // C4: OFI 一致性（同号交易所占比）
+    features.push(snap.ofi_agreement(30_000).unwrap_or(f64::NAN));
+
+    // C5-C6: 成交流失衡 30s / 60s
+    features.push(snap.trade_flow_imbalance(30_000).unwrap_or(f64::NAN));
+    features.push(snap.trade_flow_imbalance(60_000).unwrap_or(f64::NAN));
+
+    // C7: 大单（P75+）方向失衡
+    features.push(snap.large_flow_imbalance(60_000).unwrap_or(f64::NAN));
+
+    // C8: 成交 VWAP 相对开盘价偏离
+    features.push(snap.vwap_dev(60_000).unwrap_or(f64::NAN));
+
+    // ── D. 动量 ───────────────────────────────────────────────────────────────
+
+    // D1: TWAP 全窗口线性斜率（相对，/秒）
     let slope_all = {
         let xs: Vec<f64> = snap.twap_ticks.iter()
             .map(|t| (t.obs_ms - snap.win_start_ms) as f64 / 1000.0)
@@ -120,12 +145,11 @@ pub fn compute_features(snap: &WindowSnapshot) -> FeatureVector {
             .map(|t| t.price.try_into().unwrap_or(f64::NAN))
             .collect();
         let s = slope_per_sec(&xs, &ys);
-        // 归一化：除以 open，转为相对斜率
         if s.is_nan() || open == 0.0 { f64::NAN } else { s / open }
     };
     features.push(slope_all);
 
-    // B5: 最近 60s 内的线性斜率（捕捉近期动量）
+    // D2: TWAP 近 60s 线性斜率
     let slope_recent = {
         let cutoff = snap.snap_ms - 60_000;
         let recent: Vec<&crate::snapshot::TwapTick> = snap.twap_ticks.iter()
@@ -142,82 +166,64 @@ pub fn compute_features(snap: &WindowSnapshot) -> FeatureVector {
     };
     features.push(slope_recent);
 
-    // ── C. 结构类（布朗运动归一化）────────────────────────────────────────────
+    // D3: 动量加速比 slope_recent / slope_all（>1 加速，<1 衰减）
+    let slope_ratio = if slope_all.abs() < 1e-15 || slope_all.is_nan() || slope_recent.is_nan() {
+        f64::NAN
+    } else {
+        slope_recent / slope_all
+    };
+    features.push(slope_ratio);
 
-    // C1: normalized_distance = (P_now - P_open) / (σ · √t_remaining_s)
-    features.push(snap.normalized_distance().unwrap_or(f64::NAN));
+    // D4: TWAP 近 30s 收益率
+    let past_30s = price_n_ms_ago(snap, 30_000);
+    let ret_30s = if past_30s.is_nan() || past_30s == 0.0 || current.is_nan() { f64::NAN }
+                  else { (current - past_30s) / past_30s };
+    features.push(ret_30s);
 
-    // C2: normalized_distance 的平方（捕捉非线性，方向无关的偏移幅度）
-    let nd = snap.normalized_distance().unwrap_or(f64::NAN);
-    features.push(if nd.is_nan() { f64::NAN } else { nd * nd });
+    // D5: 现货 BBO 近 30s 线性斜率
+    features.push(snap.spot_slope(30_000).unwrap_or(f64::NAN));
 
-    // C3: 时间分数：已用时间 / 总窗口时长（0 ~ 1）
-    let time_frac = elapsed_s / 300.0;
-    features.push(time_frac);
+    // ── E. 噪声/波动 ──────────────────────────────────────────────────────────
 
-    // C4: √时间分数（使时间维度与布朗运动的 √t 缩放对齐）
-    features.push(time_frac.sqrt());
-
-    // C5: 已实现波动率（annualized 不重要，相对值即可）：标准差 / open
+    // E1: TWAP 全窗口相对波动率
     let vol = snap.price_std().unwrap_or(f64::NAN);
     let rel_vol = if vol.is_nan() || open == 0.0 { f64::NAN } else { vol / open };
     features.push(rel_vol);
 
-    // ── D. 质量类（不直接预测方向，用于样本加权 / 过滤）────────────────────
+    // E2: 波动加速比 σ_60s / σ_full
+    features.push(snap.vol_ratio().unwrap_or(f64::NAN));
 
-    // D1: tick 密度（tick/秒），反映数据完整性
-    let tick_density = if elapsed_s > 0.0 {
-        snap.tick_count() as f64 / elapsed_s
-    } else {
-        f64::NAN
-    };
-    features.push(tick_density);
+    // E3: 现货 BBO 近 60s 已实现波动率
+    features.push(snap.spot_vol_rel().unwrap_or(f64::NAN));
 
-    // D2: 最近 tick 距 snap_ms 的延迟（秒），越小越新鲜
-    let staleness_s = snap.twap_ticks.last().map(|t| {
-        (snap.snap_ms - t.obs_ms).max(0) as f64 / 1000.0
-    }).unwrap_or(f64::NAN);
-    features.push(staleness_s);
-
-    // ── E. 交易所类（现货领先 TWAP 的信息）──────────────────────────────────
-    //
-    // 核心逻辑：TWAP30 是 30 秒滞后平均，现货此刻的价格包含了 TWAP
-    // 尚未吸收的信息。TWAP 在数学上必然向现货收敛，所以现货-TWAP 的
-    // 价差预示 TWAP 接下来 30 秒的走向 —— 而收盘价正是由 TWAP 决定的。
-    //
-    // 但原始基差不能直接用：实测五个 symbol 的基差均值都稳定在 +9bp 附近
-    // （标准差仅 1~2bp，正比例接近 100%），这是 USDT/USD 溢价（实测约 +9.7bp）与我们
-    // 的买卖中点定义之间的口径差，不含方向信息。真正的信号是"此刻的基差
-    // 相对本窗口常态偏高还是偏低"，所以下面两个特征都做了去均值处理。
-
-    // E1: 基差相对窗口内均值的偏离
-    let basis_dev = snap.spot_basis_dev().unwrap_or(f64::NAN);
-    features.push(basis_dev);
-
-    // E2: 同一偏离除以其自身标准差 —— 无量纲，跨 symbol / 跨波动环境可比
-    features.push(snap.spot_basis_dev_z().unwrap_or(f64::NAN));
-
-    // E3-E5: 30s / 60s / 全窗口的成交流失衡，(买量-卖量)/总量 ∈ [-1,1]
-    for window_ms in [30_000_i64, 60_000] {
-        features.push(snap.trade_flow_imbalance(window_ms).unwrap_or(f64::NAN));
-    }
-    features.push(snap.trade_flow_imbalance(snap.elapsed_ms().max(1)).unwrap_or(f64::NAN));
-
-    // E6: 盘口失衡（各家最新 BBO 的 bid_qty 占比均值），>0.5 买盘更厚
-    features.push(snap.book_imbalance().unwrap_or(f64::NAN));
-
-    // E7: 平均相对价差 —— 走阔意味着流动性变差
+    // E4: 平均相对价差
     features.push(snap.mean_rel_spread().unwrap_or(f64::NAN));
 
-    // E8: 跨交易所价格分歧度 —— 分歧大时方向信号可信度下降
+    // E5: 跨交易所价格分歧度
     features.push(snap.cross_exchange_dispersion().unwrap_or(f64::NAN));
 
-    // E9: 最近 30 秒成交笔数，取对数压缩量级差异（不同 symbol 差几个数量级）
+    // ── F. 质量/制度 ──────────────────────────────────────────────────────────
+
+    // F1: TWAP tick 密度（tick/秒）
+    let tick_density = if elapsed_s > 0.0 { snap.tick_count() as f64 / elapsed_s }
+                       else { f64::NAN };
+    features.push(tick_density);
+
+    // F2: 最近 tick 距 snap_ms 的延迟（秒）
+    let staleness_s = snap.twap_ticks.last()
+        .map(|t| (snap.snap_ms - t.obs_ms).max(0) as f64 / 1000.0)
+        .unwrap_or(f64::NAN);
+    features.push(staleness_s);
+
+    // F3: 有有效 BBO 的交易所家数
+    features.push(snap.active_exchange_count() as f64);
+
+    // F4: ln(1 + 近 30s 成交笔数)
     let tc30 = snap.trade_count_in_last(30_000) as f64;
     features.push((1.0 + tc30).ln());
 
-    // E10: 有 BBO 数据的交易所家数（质量类，用于判断 E1-E8 的可信度）
-    features.push(snap.active_exchange_count() as f64);
+    // F5: symbol 编号（categorical，pooled 模型必须）
+    features.push(symbol_id(&snap.symbol));
 
     debug_assert_eq!(
         features.len(), FEATURE_COUNT,
@@ -244,11 +250,12 @@ mod tests {
     fn make_snap(win_start_ms: i64, snap_ms: i64, ticks: Vec<(i64, rust_decimal::Decimal)>) -> WindowSnapshot {
         WindowSnapshot {
             snap_ms,
-            symbol: "btc/usd".to_string(),
+            symbol:          "btc/usd".to_string(),
             win_start_ms,
-            twap_ticks: ticks.into_iter().map(|(obs_ms, price)| TwapTick { obs_ms, price }).collect(),
-            bbo_ticks:   Vec::new(),
-            trade_ticks: Vec::new(),
+            twap_ticks:      ticks.into_iter().map(|(obs_ms, price)| TwapTick { obs_ms, price }).collect(),
+            bbo_ticks:       Vec::new(),
+            trade_ticks:     Vec::new(),
+            fx_usdt_premium: None,
         }
     }
 
@@ -262,11 +269,12 @@ mod tests {
     ) -> WindowSnapshot {
         WindowSnapshot {
             snap_ms,
-            symbol: "btc/usd".to_string(),
+            symbol:          "btc/usd".to_string(),
             win_start_ms,
-            twap_ticks: ticks.into_iter().map(|(obs_ms, price)| TwapTick { obs_ms, price }).collect(),
-            bbo_ticks:   bbos,
-            trade_ticks: trades,
+            twap_ticks:      ticks.into_iter().map(|(obs_ms, price)| TwapTick { obs_ms, price }).collect(),
+            bbo_ticks:       bbos,
+            trade_ticks:     trades,
+            fx_usdt_premium: None,
         }
     }
 
@@ -341,10 +349,10 @@ mod tests {
         // 上涨：price_position 应接近 1（当前价接近最高）
         assert!(fv.features[idx("price_position")] > 0.9,
             "稳定上涨时 price_position 应接近 1.0");
-        // 上涨：norm_dist > 0
-        let nd = fv.features[idx("norm_dist")];
-        assert!(!nd.is_nan(), "norm_dist 不应为 NAN");
-        assert!(nd > 0.0, "上涨行情 norm_dist 应为正");
+        // 上涨：twap_norm_dist > 0
+        let nd = fv.features[idx("twap_norm_dist")];
+        assert!(!nd.is_nan(), "twap_norm_dist 不应为 NAN");
+        assert!(nd > 0.0, "上涨行情 twap_norm_dist 应为正");
         // 上涨：全窗口斜率 > 0
         assert!(fv.features[idx("slope_all")] > 0.0,
             "上涨行情 slope_all 应为正");
@@ -362,30 +370,9 @@ mod tests {
         let fv = compute_features(&snap);
         // 向量长度仍必须固定
         assert_eq!(fv.features.len(), FEATURE_COUNT);
-        // 标准差不足（n<2）→ norm_dist 必须是 NAN
-        let idx_nd = fv.feature_names.iter().position(|n| n == "norm_dist").unwrap();
-        assert!(fv.features[idx_nd].is_nan(), "单 tick 时 norm_dist 应为 NAN");
-    }
-
-    // ── 时间特征在 T-110s 时的值 ─────────────────────────────────────────────
-
-    #[test]
-    fn time_frac_at_pred_point() {
-        let win_start = 1_786_401_600_000_i64;
-        let snap_ms   = win_start + 190_000; // T-110s 预测时点
-        let snap = make_snap(win_start, snap_ms, vec![
-            (win_start, dec!(63900.0)),
-            (snap_ms,   dec!(63910.0)),
-        ]);
-        let fv = compute_features(&snap);
-        let idx = |name: &str| fv.feature_names.iter().position(|n| n == name).unwrap();
-
-        let tf = fv.features[idx("time_frac")];
-        // 190/300 ≈ 0.6333
-        assert!((tf - 190.0/300.0).abs() < 1e-9, "time_frac 应为 190/300，got {tf}");
-        let tfs = fv.features[idx("time_frac_sqrt")];
-        assert!((tfs - (190.0/300.0_f64).sqrt()).abs() < 1e-9,
-            "time_frac_sqrt 应为 √(190/300)，got {tfs}");
+        // 标准差不足（n<2）→ twap_norm_dist 必须是 NAN
+        let idx_nd = fv.feature_names.iter().position(|n| n == "twap_norm_dist").unwrap();
+        assert!(fv.features[idx_nd].is_nan(), "单 tick 时 twap_norm_dist 应为 NAN");
     }
 
     // ── 质量特征：tick 密度与 staleness ───────────────────────────────────────
@@ -658,7 +645,7 @@ mod tests {
         assert_eq!(fv.features.len(), FEATURE_COUNT, "向量长度必须固定");
 
         let idx = |n: &str| fv.feature_names.iter().position(|x| x == n).unwrap();
-        for name in ["spot_basis_dev", "spot_basis_dev_z", "flow_imb_30s", "book_imb", "rel_spread"] {
+        for name in ["basis_dev", "basis_dev_z", "flow_imb_30s", "rel_spread"] {
             assert!(fv.features[idx(name)].is_nan(),
                 "无交易所数据时 {name} 应为 NAN");
         }
@@ -671,39 +658,47 @@ mod tests {
 // ── 特征名称注册表 ────────────────────────────────────────────────────────────
 
 /// 特征总数，与下面的 FEATURE_NAMES 必须保持同步
-pub const FEATURE_COUNT: usize = 26;
+pub const FEATURE_COUNT: usize = 33;
 
 /// 特征名称，与 compute_features 输出顺序严格对应
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
-    // A. 位置类（TWAP）
-    "ret_so_far",       // A1: 窗口内总收益率
-    "price_position",   // A2: 价格在最高最低之间的位置 [0,1]
-    "dist_from_hi",     // A3: 距最高价的相对距离
-    "dist_from_lo",     // A4: 距最低价的相对距离
-    // B. 动量类（TWAP）
-    "ret_30s",          // B1: 最近 30s 收益率
-    "ret_60s",          // B2: 最近 60s 收益率
-    "ret_90s",          // B3: 最近 90s 收益率
-    "slope_all",        // B4: 全窗口线性斜率（相对，/秒）
-    "slope_recent",     // B5: 最近 60s 线性斜率（相对，/秒）
-    // C. 结构类（TWAP）
-    "norm_dist",        // C1: 归一化距离
-    "norm_dist_sq",     // C2: 归一化距离的平方
-    "time_frac",        // C3: 时间分数 [0,1]
-    "time_frac_sqrt",   // C4: √时间分数
-    "rel_vol",          // C5: 相对波动率
-    // D. 质量类（TWAP）
-    "tick_density",     // D1: tick/秒
-    "staleness_s",      // D2: 最近 tick 距 snap_ms 的延迟（秒）
-    // E. 交易所类
-    "spot_basis_dev",   // E1: 基差相对窗口均值的偏离（已去掉 ~+9bp 常数偏移）
-    "spot_basis_dev_z", // E2: 同一偏离 / 其窗口内标准差
-    "flow_imb_30s",     // E3: 最近 30s 成交流失衡 [-1,1]
-    "flow_imb_60s",     // E4: 最近 60s 成交流失衡
-    "flow_imb_win",     // E5: 全窗口成交流失衡
-    "book_imb",         // E6: 盘口失衡（bid 占比均值）
-    "rel_spread",       // E7: 平均相对价差
-    "xex_dispersion",   // E8: 跨交易所价格分歧度
-    "log_trades_30s",   // E9: ln(1 + 最近 30s 成交笔数)
-    "n_exchanges",      // E10: 有报价的交易所家数
+    // A. 垫子类（距 label 翻转还有多远）
+    "ret_so_far",           // A1: TWAP 窗口内总收益率
+    "price_position",       // A2: TWAP 在最高最低之间的位置 [0,1]
+    "spot_ret_from_open",   // A3: 现货（FX 剥离）相对开盘价收益率 ★
+    "twap_norm_dist",       // A4: TWAP 归一化距离（布朗运动参考）
+    "spot_norm_dist",       // A5: 现货归一化距离（严格更优版本）★
+    // B. TWAP-现货缺口（独有 alpha）
+    "basis_dev",            // B1: 基差相对窗口均值的偏离
+    "basis_dev_z",          // B2: 同一偏离 / 窗口内标准差
+    "basis_slope_30s",      // B3: basis 近 30s 线性斜率（缺口是否仍在扩大）★
+    "basis_slope_60s",      // B4: basis 近 60s 线性斜率 ★
+    "twap_spot_gap_norm",   // B5: (spot_usd - twap) / (σ·√t_rem)，待吸收缺口 ★
+    // C. 订单流
+    "ofi_10s",              // C1: OFI 近 10s，归一化 ★
+    "ofi_30s",              // C2: OFI 近 30s ★
+    "ofi_60s",              // C3: OFI 近 60s ★
+    "ofi_agreement",        // C4: OFI 同号交易所占比（一致性）★
+    "flow_imb_30s",         // C5: 成交流失衡近 30s
+    "flow_imb_60s",         // C6: 成交流失衡近 60s
+    "large_flow_imb_60s",   // C7: 大单（P75+）方向失衡 ★
+    "vwap_dev",             // C8: 成交 VWAP 相对开盘价偏离 ★
+    // D. 动量
+    "slope_all",            // D1: TWAP 全窗口线性斜率
+    "slope_recent",         // D2: TWAP 近 60s 线性斜率
+    "slope_ratio",          // D3: slope_recent / slope_all（动量加速/衰减）★
+    "ret_30s",              // D4: TWAP 近 30s 收益率
+    "spot_slope_30s",       // D5: 现货 BBO 近 30s 线性斜率 ★
+    // E. 噪声/波动
+    "rel_vol",              // E1: TWAP 全窗口相对波动率
+    "vol_ratio",            // E2: σ_60s / σ_full（波动加速比）★
+    "spot_vol_rel",         // E3: 现货 BBO 近 60s 已实现波动率 ★
+    "rel_spread",           // E4: 平均相对价差
+    "xex_dispersion",       // E5: 跨交易所价格分歧度
+    // F. 质量/制度
+    "tick_density",         // F1: TWAP tick/秒
+    "staleness_s",          // F2: 最近 tick 距 snap_ms 延迟（秒）
+    "n_exchanges",          // F3: 有有效 BBO 的交易所家数
+    "log_trades_30s",       // F4: ln(1 + 近 30s 成交笔数)
+    "symbol_id",            // F5: symbol 编号（categorical，pooled 模型必须）★
 ];
