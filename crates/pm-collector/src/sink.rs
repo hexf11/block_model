@@ -7,6 +7,25 @@
 //!   * 交易所 —— 约 2500 msg/s。全量镜像会烧掉约 43 GB/天，所以
 //!     只在 ClickHouse 插入失败时才写 JSONL。这样既保住"不丢数据"
 //!     的保证，又不产生磁盘账单。
+//!
+//! ## 为什么写入必须离开读循环
+//!
+//! 早期版本在 WebSocket 读循环里直接 `sink.maybe_flush().await`。数据没丢
+//! （缓冲无界、失败会 spill），但**时间戳塌了**：flush 等待 ClickHouse 的
+//! 几毫秒里，WS 帧堆在 OS socket 缓冲区；插入返回后代码连读一整批，
+//! `now_ms()` 在这期间几乎不变，于是整批报价拿到同一个 recv_ms。
+//!
+//! 实测证据——binance BTC 的 BBO 里，恰好 200 条挤在同一毫秒的情况出现了
+//! 44 次，199/198/197 条各数次。200 正是 CH_BATCH_SIZE，这是 flush 阻塞
+//! 留下的指纹。
+//!
+//! 后果对 OFI（order flow imbalance）是致命的：OFI 的定义就是逐笔比较相邻
+//! 两条报价，时间戳塌成一个点之后，任何按时间窗口切分的 OFI 都会在边界
+//! 错配。更要紧的是整个快照的防泄漏保证建立在 recv_ms 上——它必须是
+//! "我们真正收到这一帧的时刻"，不能是"我们腾出手来处理它的时刻"。
+//!
+//! 所以现在：读循环只 `push_*`（纯内存操作，纳秒级），由独立 task negotiate
+//! ClickHouse。`WriterHandle` 是读循环唯一接触的东西。
 
 use crate::config::Config;
 use clickhouse::{Client, Row, RowOwned, RowWrite};
@@ -50,6 +69,7 @@ pub struct BookRow {
     pub asks_json:   String,
     pub is_snapshot: u8,
     pub seq:         u64,
+    pub first_seq:   u64,
 }
 
 #[derive(Row, Serialize)]
@@ -124,6 +144,7 @@ impl From<&BookRecord> for BookRow {
             asks_json:   ladder_json(&r.asks),
             is_snapshot: r.is_snapshot as u8,
             seq:         r.seq.unwrap_or(0),
+            first_seq:   r.first_seq.unwrap_or(0),
         }
     }
 }
@@ -294,6 +315,94 @@ impl Sink {
     }
 }
 
+// ── 异步写入器 ──────────────────────────────────────────────────────────────
+
+/// 一批待写入的记录。读循环把这些丢进 channel 就立刻返回。
+pub enum WriteMsg {
+    Bbo(BboRow),
+    Trade(TradeRow),
+    Book(BookRow),
+    Twap(TwapRow),
+    /// 请求立即刷盘（断线时用，确保半批数据不滞留）
+    Flush,
+}
+
+/// 读循环持有的写入句柄。所有方法都是非阻塞的纯内存操作。
+#[derive(Clone)]
+pub struct WriterHandle {
+    tx: tokio::sync::mpsc::Sender<WriteMsg>,
+    /// channel 满时丢弃的记录数。非零就说明写入端跟不上采集速度，
+    /// 必须调查——这是唯一会真正丢数据的路径。
+    pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WriterHandle {
+    /// 入队一条记录。channel 满时计数并丢弃，绝不阻塞读循环——
+    /// 阻塞会重新引入时间戳塌陷问题，那比丢几条记录更糟：
+    /// 丢记录是可观测的（dropped 计数），时间戳塌陷是静默的。
+    fn send(&self, msg: WriteMsg) {
+        if self.tx.try_send(msg).is_err() {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn push_bbo(&self, r: &BboRecord)     { self.send(WriteMsg::Bbo(r.into())); }
+    pub fn push_trade(&self, r: &TradeRecord) { self.send(WriteMsg::Trade(r.into())); }
+    pub fn push_book(&self, r: &BookRecord)   { self.send(WriteMsg::Book(r.into())); }
+
+    pub fn push_twap(&self, r: &TwapRecord) -> bool {
+        match TwapRow::try_from(r) {
+            Ok(row) => { self.send(WriteMsg::Twap(row)); true }
+            Err(e) => {
+                tracing::warn!("twap value_e18 无法解析 ({e})，丢弃: {}", r.value_e18);
+                false
+            }
+        }
+    }
+
+    pub fn request_flush(&self) { self.send(WriteMsg::Flush); }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 启动写入 task，返回读循环用的句柄。
+///
+/// channel 容量按最坏情况定：binance BTC 的 BBO 单秒峰值实测 1407 条，
+/// 五个 symbol 五家交易所叠加后短时可达数千。65536 给了约 10 秒的缓冲，
+/// 足以吸收 ClickHouse 的偶发慢插入，又不至于在真正故障时无限吃内存。
+pub fn spawn_writer(cfg: &Config) -> WriterHandle {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteMsg>(65536);
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut sink = Sink::new(cfg);
+
+    tokio::spawn(async move {
+        // 兜底定时刷盘：低频数据（kraken 0.24/s）不该在缓冲区里等到攒够一批
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };   // 所有 handle 已释放
+                    match msg {
+                        WriteMsg::Bbo(r)   => sink.bbo.push(r),
+                        WriteMsg::Trade(r) => sink.trades.push(r),
+                        WriteMsg::Book(r)  => sink.book.push(r),
+                        WriteMsg::Twap(r)  => sink.twap.push(r),
+                        WriteMsg::Flush    => sink.flush_all().await,
+                    }
+                    sink.maybe_flush().await;
+                }
+                _ = tick.tick() => { sink.flush_all().await; }
+            }
+        }
+        sink.flush_all().await;
+    });
+
+    WriterHandle { tx, dropped }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,10 +486,12 @@ mod tests {
             asks:        vec![],
             is_snapshot: true,
             seq:         None,
+            first_seq:   None,
         };
         let row = BookRow::from(&r);
         assert_eq!(row.is_snapshot, 1);
         assert_eq!(row.seq, 0, "缺失的 seq 应变为 0，而不是包装后的哨兵值");
+        assert_eq!(row.first_seq, 0);
         assert_eq!(row.asks_json, "[]");
     }
 

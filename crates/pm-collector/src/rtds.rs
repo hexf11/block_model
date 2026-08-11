@@ -78,7 +78,8 @@ async fn run_session(cfg: &Config) -> Result<String> {
     });
     ws.send(Message::Text(sub.to_string().into())).await?;
 
-    let mut sink       = Sink::new(cfg);
+    let sink           = crate::sink::spawn_writer(cfg);
+    let jsonl          = Sink::new(cfg);   // 仅用于 JSONL 镜像，不写 ClickHouse
     let mut ping_tick  = tokio::time::interval(Duration::from_secs(cfg.rtds_ping_s.max(1)));
     let mut flush_tick = tokio::time::interval(Duration::from_secs(1));
     ping_tick.tick().await;
@@ -102,11 +103,10 @@ async fn run_session(cfg: &Config) -> Result<String> {
                         msgs += 1;
                         if let Some(rec) = parse_frame(t.as_str(), now_ms()) {
                             // JSONL：所有 symbol，无条件写入
-                            sink.mirror_jsonl(&rec, "twap30");
+                            jsonl.mirror_jsonl(&rec, "twap30");
                             // CH：仅目标 symbol
                             if cfg.is_target(&rec.symbol) {
                                 sink.push_twap(&rec);
-                                sink.maybe_flush().await;
                             }
                         }
                     }
@@ -126,17 +126,15 @@ async fn run_session(cfg: &Config) -> Result<String> {
                 if last_msg.elapsed() > stale {
                     break format!("stale: no frame for {}s", last_msg.elapsed().as_secs());
                 }
-                sink.flush_all().await;
                 secs += 1;
                 if secs % 60 == 0 {
-                    tracing::info!("rtds: {msgs} msgs, {} rows ok, {} rows failed",
-                        sink.ok_rows, sink.fail_rows);
+                    tracing::info!("rtds: {msgs} msgs, {} dropped", sink.dropped_count());
                 }
             }
         }
     };
 
-    sink.flush_all().await;
+    sink.request_flush();
     Ok(reason)
 }
 

@@ -87,7 +87,15 @@ pub struct BookRecord {
     pub bids:        Vec<[Decimal; 2]>,
     pub asks:        Vec<[Decimal; 2]>,
     pub is_snapshot: bool,
+    /// 本条增量覆盖区间的**末**个更新 ID（binance 的 `u`、okx 的 `seqId` 等）
     pub seq:         Option<u64>,
+    /// 本条增量覆盖区间的**首**个更新 ID（binance 的 `U`、okx 的 `prevSeqId`）。
+    ///
+    /// 没有这个字段就无法判断增量流是否连续：binance 的 `@depth@100ms` 是
+    /// 100ms 聚合推送，一条消息覆盖 `U..u` 一整个区间，所以相邻两条的 `u`
+    /// 本来就会跳号——只看 `u` 会把正常聚合误判成大规模丢帧。
+    /// 真正的连续性条件是 `本条.first_seq == 上条.seq + 1`。
+    pub first_seq:   Option<u64>,
 }
 
 /// Polymarket RTDS twap30 数据点

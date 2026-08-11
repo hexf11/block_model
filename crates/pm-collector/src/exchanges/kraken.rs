@@ -110,6 +110,7 @@ impl ExchangeSpec for KrakenCollector {
                         asks:        parse_levels(Some(&d["asks"])),
                         is_snapshot,
                         seq:         d["checksum"].as_u64(), // 复用 seq 字段存放完整性校验和
+                        first_seq:   None,                     // kraken 不提供序列号，靠 checksum 校验
                     }));
                 }
             }

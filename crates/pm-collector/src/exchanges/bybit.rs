@@ -99,6 +99,8 @@ impl ExchangeSpec for BybitCollector {
                 asks:        util::ladder(Some(&data["a"])),
                 is_snapshot,
                 seq:         data["seq"].as_u64().or_else(|| data["u"].as_u64()),
+                // bybit 的 u 是单调递增的更新 ID，没有独立的区间起点
+                first_seq:   data["u"].as_u64(),
             })];
         }
 

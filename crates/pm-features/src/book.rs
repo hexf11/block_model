@@ -82,4 +82,20 @@ impl OrderBook {
     pub fn level_count(&self) -> (usize, usize) {
         (self.bids.len(), self.asks.len())
     }
+
+    /// 导出当前盘口的全部档位，买盘按价格降序、卖盘按升序（即从最优档往外）。
+    ///
+    /// 用于周期性快照重播：bybit/kraken/coinbase 只在连接时发一次快照，
+    /// 之后全是增量。离线重建若只能回溯到连接点，就得顺序重放数万条增量；
+    /// 定期落一份完整盘口，把重建成本压到一个重播周期以内。
+    pub fn to_ladders(&self) -> (Vec<[Decimal; 2]>, Vec<[Decimal; 2]>) {
+        let bids = self.bids.iter().rev().map(|(&p, &q)| [p, q]).collect();
+        let asks = self.asks.iter().map(|(&p, &q)| [p, q]).collect();
+        (bids, asks)
+    }
+
+    /// 盘口是否已就绪（两侧都有档位）。未就绪时重播快照没有意义。
+    pub fn is_ready(&self) -> bool {
+        !self.bids.is_empty() && !self.asks.is_empty()
+    }
 }

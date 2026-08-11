@@ -28,6 +28,11 @@ clickhouse       = { version = "0.15" }
 # HTTP server (inference service)
 axum             = { version = "0.8" }
 
+# HTTP client —— binance L2 底图必须走 REST 拉取（见 exchanges/binance.rs）。
+# 关掉默认 features 改用 native-tls，复用 clickhouse crate 已经引入的
+# hyper 1.x + native-tls，不额外引入一套 rustls。
+reqwest          = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
+
 # Feature engineering / numerics
 polars           = { version = "0.55",  features = ["lazy"] }
 

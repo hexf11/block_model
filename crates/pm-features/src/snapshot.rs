@@ -208,8 +208,10 @@ impl WindowSnapshot {
     /// 现货相对 TWAP 的原始基差：(consensus_mid - twap_now) / twap_now
     ///
     /// ⚠️ 这个值含有约 +9bp 的系统性偏移（五个 symbol 实测均值 8.9~9.6bp，
-    /// 正比例接近 100%，标准差仅 1~2bp）。成因是 Chainlink 的价格构成
-    /// 与我们算的现货买卖中点定义不同，不会随时间消失。
+    /// 正比例接近 100%，标准差仅 1~2bp）。成因是 USDT/USD 轻微溢价（实测
+    /// ~+9.7bp）：我们的现货数据来自 Binance/OKX/Bybit（USDT 计价），而
+    /// Polymarket 参考价是 USD 计价，两者之间系统性差了一个 USDT 溢价，
+    /// 不会随时间消失。
     ///
     /// 直接做特征会退化成常数 —— 真正的信号在 `spot_basis_dev()` 里。
     /// 这里保留原始值供诊断和特征构造使用。
@@ -584,7 +586,6 @@ mod tests {
     #[should_panic(expected = "快照安全违规")]
     fn future_tick_panics() {
         let snap_ms   = 1_786_403_590_000_i64;
-        let win_start = (snap_ms / 300_000) * 300_000;
         let future_ms = snap_ms + 1000;
 
         // 模拟 SnapshotBuilder 的双重检查逻辑

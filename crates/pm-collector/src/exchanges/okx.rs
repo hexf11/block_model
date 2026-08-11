@@ -89,6 +89,7 @@ impl ExchangeSpec for OkxCollector {
                     asks:        util::ladder(Some(&d["asks"])),
                     is_snapshot: true, // books5 每次都发送完整快照
                     seq:         d["seqId"].as_u64(),
+                    first_seq:   d["prevSeqId"].as_u64(),
                 })]
             }
             _ => vec![],

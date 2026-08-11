@@ -116,6 +116,7 @@ impl ExchangeSpec for CoinbaseCollector {
                         asks,
                         is_snapshot,
                         seq:      msg["sequence_num"].as_u64(),
+                        first_seq: msg["sequence_num"].as_u64(),
                     }));
                 }
             }
