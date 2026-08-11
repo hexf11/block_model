@@ -38,11 +38,55 @@ fn ch_query_raw(ch_url: &str, sql: &str) -> Result<Vec<serde_json::Value>> {
 
 // ── 核心数据结构 ──────────────────────────────────────────────────────────────
 
+/// BBO 报价的过期阈值（毫秒）。
+///
+/// 超过这个时间没更新的报价，视为该交易所此刻"没有意见"，不参与共识价、
+/// 分歧度等特征。3 秒的取值来源：binance/okx/bybit 在正常行情下的更新间隔
+/// 都在百毫秒量级，3 秒足够宽松；而 kraken 约 0.2/s 的推送频率会被稳定剔除，
+/// 正是我们要挡掉的那类"看起来在报价、其实是十几秒前的旧值"。
+pub const BBO_STALE_MS: i64 = 3_000;
+
 /// TWAP tick 的轻量表示（仅快照需要的字段）
 #[derive(Debug, Clone)]
 pub struct TwapTick {
     pub obs_ms: i64,
     pub price:  Decimal,
+}
+
+/// 交易所 BBO 快照点。
+///
+/// 时间用 recv_ms（本地接收时间），不用 ts_ex：交易所时钟可能有偏移
+/// 甚至跳变，只有本地接收时间对我们具备因果性 —— 在 recv_ms 之前
+/// 我们不可能知道这条数据。
+#[derive(Debug, Clone)]
+pub struct BboTick {
+    pub exchange: String,
+    pub recv_ms:  i64,
+    pub bid:      f64,
+    pub bid_qty:  f64,
+    pub ask:      f64,
+    pub ask_qty:  f64,
+}
+
+impl BboTick {
+    pub fn mid(&self) -> f64 { (self.bid + self.ask) / 2.0 }
+    pub fn spread(&self) -> f64 { self.ask - self.bid }
+    /// bid_qty / (bid_qty + ask_qty)，>0.5 表示买盘更厚
+    pub fn imbalance(&self) -> Option<f64> {
+        let total = self.bid_qty + self.ask_qty;
+        if total <= 0.0 { None } else { Some(self.bid_qty / total) }
+    }
+}
+
+/// 交易所成交记录
+#[derive(Debug, Clone)]
+pub struct TradeTick {
+    pub exchange: String,
+    pub recv_ms:  i64,
+    pub price:    f64,
+    pub qty:      f64,
+    /// true = 买方主动成交（taker buy）
+    pub is_buy:   bool,
 }
 
 /// 给定 symbol + snap_ms 的完整快照
@@ -55,6 +99,10 @@ pub struct WindowSnapshot {
     pub win_start_ms: i64,
     /// 窗口内所有 TWAP tick，obs_ms <= snap_ms，按 obs_ms 升序
     pub twap_ticks:  Vec<TwapTick>,
+    /// 窗口内所有交易所 BBO，recv_ms <= snap_ms，按 recv_ms 升序
+    pub bbo_ticks:   Vec<BboTick>,
+    /// 窗口内所有成交，recv_ms <= snap_ms，按 recv_ms 升序
+    pub trade_ticks: Vec<TradeTick>,
 }
 
 impl WindowSnapshot {
@@ -108,6 +156,198 @@ impl WindowSnapshot {
     /// tick 数量（数据质量指标）
     pub fn tick_count(&self) -> usize {
         self.twap_ticks.len()
+    }
+
+    // ── 交易所侧访问器 ────────────────────────────────────────────────────────
+
+    /// 各交易所在 snap_ms 时刻的最新 BBO（每家一条，含过期报价）
+    ///
+    /// 诊断用。做特征请用 `latest_bbo_per_exchange()` —— 那个版本会剔除
+    /// 过期报价，避免把"陈旧"误读成"分歧"。
+    pub fn latest_bbo_per_exchange_raw(&self) -> Vec<&BboTick> {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        // 反向遍历，每家交易所第一次出现的就是最新的
+        for t in self.bbo_ticks.iter().rev() {
+            if !seen.iter().any(|e| *e == t.exchange.as_str()) {
+                seen.push(&t.exchange);
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// 各交易所在 snap_ms 时刻的**有效**最新 BBO（每家一条）
+    ///
+    /// 剔除超过 `BBO_STALE_MS` 未更新的报价。kraken 的更新频率只有约 0.2/s，
+    /// 实测某个窗口里它的最后一条报价已经 12.4 秒未动、偏离中位数 60 美元 ——
+    /// 把它算进 `cross_exchange_dispersion()` 会让那个特征在量化"陈旧程度"
+    /// 而不是"真实分歧"。一家交易所报价过期，就等于它此刻没有意见。
+    pub fn latest_bbo_per_exchange(&self) -> Vec<&BboTick> {
+        self.latest_bbo_per_exchange_raw()
+            .into_iter()
+            .filter(|t| self.snap_ms - t.recv_ms <= BBO_STALE_MS)
+            .collect()
+    }
+
+    /// 跨交易所的合成中间价：各家最新 mid 的中位数。
+    ///
+    /// 用中位数而非均值 —— 单家交易所抽风（报价卡住、闪崩）不该污染信号。
+    pub fn consensus_mid(&self) -> Option<f64> {
+        let mut mids: Vec<f64> = self.latest_bbo_per_exchange()
+            .iter()
+            .map(|t| t.mid())
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .collect();
+        if mids.is_empty() { return None; }
+        mids.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = mids.len();
+        Some(if n % 2 == 1 { mids[n/2] } else { (mids[n/2 - 1] + mids[n/2]) / 2.0 })
+    }
+
+    /// 现货相对 TWAP 的原始基差：(consensus_mid - twap_now) / twap_now
+    ///
+    /// ⚠️ 这个值含有约 +9bp 的系统性偏移（五个 symbol 实测均值 8.9~9.6bp，
+    /// 正比例接近 100%，标准差仅 1~2bp）。成因是 Chainlink 的价格构成
+    /// 与我们算的现货买卖中点定义不同，不会随时间消失。
+    ///
+    /// 直接做特征会退化成常数 —— 真正的信号在 `spot_basis_dev()` 里。
+    /// 这里保留原始值供诊断和特征构造使用。
+    pub fn spot_twap_basis(&self) -> Option<f64> {
+        let spot = self.consensus_mid()?;
+        let twap: f64 = self.current_price()?.try_into().ok()?;
+        if twap <= 0.0 { return None; }
+        Some((spot - twap) / twap)
+    }
+
+    /// 逐时点基差序列：把窗口内每条 BBO 与当时最新的 TWAP 配对。
+    ///
+    /// TWAP 用"该 BBO 时刻之前最后一条观测"——这是当时真实可见的值，
+    /// 不会用到 BBO 之后才到达的 TWAP。
+    fn basis_series(&self) -> Vec<f64> {
+        if self.twap_ticks.is_empty() { return Vec::new(); }
+
+        // 按交易所分组取每个时刻的中位数代价太高，这里用简化口径：
+        // 对每条 BBO 单独算基差，天然按各家更新频率加权。
+        let mut out = Vec::with_capacity(self.bbo_ticks.len());
+        let mut ti = 0usize; // twap_ticks 游标，随 bbo 时间单调前进
+
+        for b in &self.bbo_ticks {
+            // 前进到最后一个 obs_ms <= b.recv_ms 的 TWAP tick
+            while ti + 1 < self.twap_ticks.len()
+                && self.twap_ticks[ti + 1].obs_ms <= b.recv_ms
+            {
+                ti += 1;
+            }
+            // 该 BBO 早于第一条 TWAP，无可配对的历史值
+            if self.twap_ticks[ti].obs_ms > b.recv_ms { continue; }
+
+            let twap: f64 = match self.twap_ticks[ti].price.try_into() {
+                Ok(v)  => v,
+                Err(_) => continue,
+            };
+            if twap <= 0.0 { continue; }
+
+            let mid = b.mid();
+            if !mid.is_finite() || mid <= 0.0 { continue; }
+            out.push((mid - twap) / twap);
+        }
+        out
+    }
+
+    /// 基差相对窗口自身均值的偏离 —— 交易所数据的真实 alpha。
+    ///
+    /// 原始基差含约 +9bp 的常数偏移（见 `spot_twap_basis`），减去窗口内
+    /// 均值后剩下的才是"现货此刻相对常态偏高还是偏低"。TWAP 向现货收敛，
+    /// 所以正偏离预示 TWAP 接下来上行。
+    ///
+    /// 用窗口内均值而非全局常数：偏移量本身会随行情缓慢漂移，
+    /// 窗口内自适应比硬编码 9bp 稳健。
+    pub fn spot_basis_dev(&self) -> Option<f64> {
+        let now = self.spot_twap_basis()?;
+        let series = self.basis_series();
+        if series.len() < 10 { return None; }   // 样本太少，均值不可靠
+        let mean = series.iter().sum::<f64>() / series.len() as f64;
+        Some(now - mean)
+    }
+
+    /// 基差偏离除以其自身标准差 —— 无量纲，跨 symbol 可比。
+    pub fn spot_basis_dev_z(&self) -> Option<f64> {
+        let now = self.spot_twap_basis()?;
+        let series = self.basis_series();
+        if series.len() < 10 { return None; }
+        let n = series.len() as f64;
+        let mean = series.iter().sum::<f64>() / n;
+        let var  = series.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let sd = var.sqrt();
+        if sd <= 0.0 || !sd.is_finite() { return None; }
+        Some((now - mean) / sd)
+    }
+
+    /// 指定时间窗内的成交（recv_ms 在 [snap_ms - window_ms, snap_ms]）
+    pub fn trades_in_last(&self, window_ms: i64) -> impl Iterator<Item = &TradeTick> {
+        let cutoff = self.snap_ms - window_ms;
+        self.trade_ticks.iter().filter(move |t| t.recv_ms >= cutoff)
+    }
+
+    /// 指定时间窗内的成交流失衡：(买量 - 卖量) / 总量，范围 [-1, 1]
+    pub fn trade_flow_imbalance(&self, window_ms: i64) -> Option<f64> {
+        let (buy, sell) = self.trades_in_last(window_ms)
+            .fold((0.0, 0.0), |(b, s), t| {
+                if t.is_buy { (b + t.qty, s) } else { (b, s + t.qty) }
+            });
+        let total = buy + sell;
+        if total <= 0.0 { None } else { Some((buy - sell) / total) }
+    }
+
+    /// 指定时间窗内的成交笔数（活跃度）
+    pub fn trade_count_in_last(&self, window_ms: i64) -> usize {
+        self.trades_in_last(window_ms).count()
+    }
+
+    /// 跨交易所的平均盘口失衡：各家最新 BBO 的 imbalance 均值。
+    /// >0.5 表示买盘整体更厚。
+    pub fn book_imbalance(&self) -> Option<f64> {
+        let vals: Vec<f64> = self.latest_bbo_per_exchange()
+            .iter()
+            .filter_map(|t| t.imbalance())
+            .collect();
+        if vals.is_empty() { return None; }
+        Some(vals.iter().sum::<f64>() / vals.len() as f64)
+    }
+
+    /// 跨交易所的平均相对价差：mean(spread / mid)。
+    /// 价差走阔通常意味着流动性变差、不确定性上升。
+    pub fn mean_rel_spread(&self) -> Option<f64> {
+        let vals: Vec<f64> = self.latest_bbo_per_exchange()
+            .iter()
+            .filter_map(|t| {
+                let m = t.mid();
+                if m > 0.0 { Some(t.spread() / m) } else { None }
+            })
+            .collect();
+        if vals.is_empty() { return None; }
+        Some(vals.iter().sum::<f64>() / vals.len() as f64)
+    }
+
+    /// 跨交易所价格分歧度：各家 mid 的相对标准差。
+    /// 分歧变大说明市场对价格没有共识，方向信号可信度下降。
+    pub fn cross_exchange_dispersion(&self) -> Option<f64> {
+        let mids: Vec<f64> = self.latest_bbo_per_exchange()
+            .iter()
+            .map(|t| t.mid())
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .collect();
+        if mids.len() < 2 { return None; }
+        let mean = mids.iter().sum::<f64>() / mids.len() as f64;
+        if mean <= 0.0 { return None; }
+        let var = mids.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / (mids.len() - 1) as f64;
+        Some(var.sqrt() / mean)
+    }
+
+    /// 有 BBO 数据的交易所家数（数据质量指标）
+    pub fn active_exchange_count(&self) -> usize {
+        self.latest_bbo_per_exchange().len()
     }
 }
 
@@ -172,12 +412,119 @@ impl SnapshotBuilder {
             ticks.push(TwapTick { obs_ms, price });
         }
 
+        let bbo_ticks   = self.fetch_bbo(symbol, win_start_ms, snap_ms)?;
+        let trade_ticks = self.fetch_trades(symbol, win_start_ms, snap_ms)?;
+
         Ok(WindowSnapshot {
             snap_ms,
             symbol: symbol.to_string(),
             win_start_ms,
             twap_ticks: ticks,
+            bbo_ticks,
+            trade_ticks,
         })
+    }
+
+    /// 读取窗口内的交易所 BBO。
+    ///
+    /// 用 recv_ms 而非 ts_ex 做边界：交易所时钟可能领先本地，
+    /// 用 ts_ex 过滤会放进我们当时还没收到的数据 —— 这正是最隐蔽的
+    /// 未来信息泄漏路径。
+    fn fetch_bbo(&self, symbol: &str, win_start_ms: i64, snap_ms: i64) -> Result<Vec<BboTick>> {
+        let sql = format!(
+            "SELECT exchange, recv_ms, bid, bid_qty, ask, ask_qty \
+             FROM pm.ex_bbo \
+             WHERE symbol = '{symbol}' \
+               AND recv_ms >= {win_start_ms} \
+               AND recv_ms <= {snap_ms} \
+             ORDER BY recv_ms ASC \
+             FORMAT JSONEachRow",
+        );
+        let rows = ch_query_raw(&self.ch_url, &sql)
+            .with_context(|| format!("ex_bbo 查询失败 symbol={symbol}"))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let recv_ms = json_i64(&row["recv_ms"])
+                .with_context(|| format!("recv_ms 解析失败: {row}"))?;
+
+            assert!(
+                recv_ms <= snap_ms,
+                "快照安全违规：bbo recv_ms={recv_ms} > snap_ms={snap_ms}"
+            );
+
+            // 价格在 ClickHouse 里是 String（保留交易所原始十进制文本）
+            let f = |k: &str| -> f64 {
+                row[k].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
+            };
+            let (bid, ask) = (f("bid"), f("ask"));
+            // 丢弃明显损坏的报价：非有限值、非正、买价高于卖价
+            if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || bid > ask {
+                continue;
+            }
+
+            out.push(BboTick {
+                exchange: row["exchange"].as_str().unwrap_or("?").to_string(),
+                recv_ms,
+                bid,
+                bid_qty: f("bid_qty"),
+                ask,
+                ask_qty: f("ask_qty"),
+            });
+        }
+        Ok(out)
+    }
+
+    /// 读取窗口内的成交记录。同样以 recv_ms 为边界。
+    fn fetch_trades(&self, symbol: &str, win_start_ms: i64, snap_ms: i64) -> Result<Vec<TradeTick>> {
+        let sql = format!(
+            "SELECT exchange, recv_ms, price, qty, side \
+             FROM pm.ex_trades \
+             WHERE symbol = '{symbol}' \
+               AND recv_ms >= {win_start_ms} \
+               AND recv_ms <= {snap_ms} \
+             ORDER BY recv_ms ASC \
+             FORMAT JSONEachRow",
+        );
+        let rows = ch_query_raw(&self.ch_url, &sql)
+            .with_context(|| format!("ex_trades 查询失败 symbol={symbol}"))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let recv_ms = json_i64(&row["recv_ms"])
+                .with_context(|| format!("recv_ms 解析失败: {row}"))?;
+
+            assert!(
+                recv_ms <= snap_ms,
+                "快照安全违规：trade recv_ms={recv_ms} > snap_ms={snap_ms}"
+            );
+
+            let f = |k: &str| -> f64 {
+                row[k].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
+            };
+            let (price, qty) = (f("price"), f("qty"));
+            if !price.is_finite() || !qty.is_finite() || price <= 0.0 || qty <= 0.0 {
+                continue;
+            }
+
+            out.push(TradeTick {
+                exchange: row["exchange"].as_str().unwrap_or("?").to_string(),
+                recv_ms,
+                price,
+                qty,
+                is_buy: row["side"].as_str() == Some("buy"),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// 从 JSON 值取 i64 —— ClickHouse 的 UInt64 序列化为字符串，其余为数字
+fn json_i64(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::String(s) => s.parse::<i64>().ok(),
+        serde_json::Value::Number(n) => n.as_i64(),
+        _ => None,
     }
 }
 
@@ -199,6 +546,8 @@ mod tests {
             symbol: "btc/usd".to_string(),
             win_start_ms,
             twap_ticks: ticks.into_iter().map(|(obs_ms, price)| TwapTick { obs_ms, price }).collect(),
+            bbo_ticks:   Vec::new(),
+            trade_ticks: Vec::new(),
         }
     }
 
