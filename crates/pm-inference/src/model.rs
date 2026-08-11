@@ -84,15 +84,15 @@ impl Model {
                 .with_context(|| format!("读取校准器失败: {}", calib_path.display()))?
         ).context("calibration.json 格式错误")?;
 
-        // 校准表必须至少 2 个点才能插值
+        // 校准表至少 1 个点（n==1 是退化情况：模型输出为常数，映射到单点）
         anyhow::ensure!(
-            calib.x.len() >= 2 && calib.x.len() == calib.y.len(),
+            calib.x.len() >= 1 && calib.x.len() == calib.y.len(),
             "calibration.json 阈值表点数不足或不匹配"
         );
-        // x 必须单调递增（isotonic 的输入），否则插值语义错乱
+        // x 必须单调不减（isotonic 的输入；允许重复阈值）
         anyhow::ensure!(
-            calib.x.windows(2).all(|w| w[0] < w[1]),
-            "calibration.json 的 x 非严格递增"
+            calib.x.windows(2).all(|w| w[0] <= w[1]),
+            "calibration.json 的 x 非单调"
         );
 
         Ok(Self { session, calib, n_features, input_name, output_name })
@@ -144,10 +144,13 @@ impl Model {
 
 /// 复现 sklearn IsotonicRegression(out_of_bounds='clip') + np.interp 的语义：
 /// 在 (x, y) 分段线性插值，超出 x 范围时钳制到两端。
+/// 单点表（退化模型输出为常数）等价于常数映射。
 pub fn isotonic_clip(raw_p: f64, calib: &Calibration) -> f64 {
     let x = &calib.x;
     let y = &calib.y;
     let n = x.len();
+
+    if n == 1 { return y[0]; }   // 退化情况：常数映射
 
     if raw_p <= x[0] { return y[0]; }
     if raw_p >= x[n - 1] { return y[n - 1]; }
@@ -205,6 +208,41 @@ mod tests {
         assert_eq!(isotonic_clip(0.2, &c), 0.1);
         assert_eq!(isotonic_clip(0.5, &c), 0.5);
         assert_eq!(isotonic_clip(0.8, &c), 0.9);
+    }
+
+    #[test]
+    fn single_point_calibration_is_constant() {
+        // 退化情况：val 上模型输出为常数（如数据量太少时），
+        // isotonic 只剩一个点 → 校准等价于常数映射。
+        let c = Calibration {
+            method: "isotonic_clip".into(),
+            x: vec![0.48],
+            y: vec![0.581],
+            raw_min: 0.48,
+            raw_max: 0.48,
+            n: 31,
+        };
+        assert_eq!(isotonic_clip(0.0, &c), 0.581);
+        assert_eq!(isotonic_clip(0.48, &c), 0.581);
+        assert_eq!(isotonic_clip(1.0, &c), 0.581);
+    }
+
+    #[test]
+    fn duplicate_thresholds_are_allowed() {
+        // isotonic 可能产生重复阈值（同 x 不同 y 被合并）—— load() 应接受。
+        // 插值对 x0 == x1 的区间退化（这里直接用点查验证单点语义）。
+        let c = Calibration {
+            method: "isotonic_clip".into(),
+            x: vec![0.3, 0.5, 0.5, 0.7],
+            y: vec![0.2, 0.4, 0.4, 0.6],
+            raw_min: 0.3,
+            raw_max: 0.7,
+            n: 4,
+        };
+        // 0.5 落在重复点上 → 应返回 0.4
+        assert!((isotonic_clip(0.5, &c) - 0.4).abs() < 1e-12);
+        // 0.4 在 (0.3,0.2)-(0.5,0.4) 之间 → 0.3
+        assert!((isotonic_clip(0.4, &c) - 0.3).abs() < 1e-12);
     }
 
     #[test]

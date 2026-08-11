@@ -170,6 +170,23 @@ def calibrate_isotonic(model, val, feat_cols, out_path: Path):
     iso = IsotonicRegression(out_of_bounds="clip", increasing=True)
     iso.fit(p_val, val["label_up"])
 
+    # 退化情况：val 上模型输出为常数（如数据量太少时），isotonic 只剩一个
+    # 点，无法插值。降级为常数映射：校准后概率 = val 上的经验 UP 率。
+    # 推理端 isotonic_clip() 对 n==1 的表返回 y[0]，两侧语义一致。
+    if len(iso.X_thresholds_) < 2:
+        emp = float(np.mean(val["label_up"]))
+        calib = {
+            "method": "isotonic_clip",
+            "x": [float(p_val[0])],
+            "y": [emp],
+            "raw_min": float(p_val.min()),
+            "raw_max": float(p_val.max()),
+            "n": int(len(p_val)),
+        }
+        out_path.write_text(json.dumps(calib, indent=2))
+        print(f"校准器已写 {out_path}  （退化：常数映射 → {emp:.4f}）")
+        return calib
+
     calib = {
         "method": "isotonic_clip",
         "x": iso.X_thresholds_.tolist(),   # 原始模型输出 p_raw
