@@ -5,14 +5,19 @@
 //!   cargo run -p pm-features --release --example export_dataset -- data/train.csv
 //!
 //! 输出格式（每行一个训练样本）：
-//!   symbol, win_start_ms, <16 个特征>, label_up, rel_move, near_tie
+//!   symbol, win_start_ms, <FEATURE_COUNT 个特征>, label_up, rel_move, near_tie
 //!
 //! 安全保证：特征全部来自 WindowSnapshot（硬边界 obs_ms <= pred_ms），
 //! 标签来自窗口结束后的 close_px。两者在时间上严格分离，不存在泄漏路径。
+//!
+//! 口径保证：同批窗口（同一 pred_ms）共享一次 USDT/USD 溢价估算，
+//! 与推理路径 build_all() 完全一致 —— FX 敏感特征（spot_ret_from_open、
+//! spot_norm_dist、twap_spot_gap_norm 等）训练时已剥离溢价，避免 train/serve skew。
 
 use anyhow::{Context, Result};
 use pm_features::features::{compute_features, FEATURE_NAMES};
 use pm_features::snapshot::SnapshotBuilder;
+use std::collections::BTreeMap;
 use std::io::Write;
 
 const CH_URL: &str = "http://127.0.0.1:8123/";
@@ -114,35 +119,48 @@ fn main() -> Result<()> {
     let mut skipped  = 0usize;
     let mut nan_rows = 0usize;
 
+    // 按 pred_ms 分组：同一预测时点的所有 symbol 共享一次 USDT/USD 溢价估算。
+    // 这一步是必须的 —— 推理路径走 build_all()，训练路径若逐个 build()
+    // 就会少掉 FX 剥离，让 spot_* 系列特征在训练/推理之间口径不一致。
+    let mut by_pred: BTreeMap<i64, Vec<&WindowLabel>> = BTreeMap::new();
     for lab in &labels {
-        // 用 pred_ms 作为快照时刻 —— 严格早于窗口收盘，不含标签信息
-        let snap = match builder.build(&lab.symbol, lab.pred_ms) {
+        by_pred.entry(lab.pred_ms).or_default().push(lab);
+    }
+    println!("按预测时点分组：{} 个批次", by_pred.len());
+
+    for (pred_ms, group) in &by_pred {
+        // build_all 需要 &[&str]；同一批次内 symbol 唯一
+        let syms: Vec<&str> = group.iter().map(|l| l.symbol.as_str()).collect();
+
+        let snaps = match builder.build_all(&syms, *pred_ms) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("  跳过 {} @ {}: {e}", lab.symbol, lab.win_start_ms);
-                skipped += 1;
+                eprintln!("  跳过整批 @ {pred_ms}: {e}");
+                skipped += group.len();
                 continue;
             }
         };
 
-        // 快照必须落在正确的窗口上，否则说明时间对齐出了问题
-        if snap.win_start_ms != lab.win_start_ms {
-            eprintln!("  跳过 {} @ {}: 快照窗口 {} 与标签窗口不一致",
-                lab.symbol, lab.win_start_ms, snap.win_start_ms);
-            skipped += 1;
-            continue;
-        }
+        for (lab, snap) in group.iter().zip(snaps.iter()) {
+            // 快照必须落在正确的窗口上，否则说明时间对齐出了问题
+            if snap.win_start_ms != lab.win_start_ms {
+                eprintln!("  跳过 {} @ {}: 快照窗口 {} 与标签窗口不一致",
+                    lab.symbol, lab.win_start_ms, snap.win_start_ms);
+                skipped += 1;
+                continue;
+            }
 
-        let fv = compute_features(&snap);
-        if fv.features.iter().any(|v| v.is_nan()) { nan_rows += 1; }
+            let fv = compute_features(snap);
+            if fv.features.iter().any(|v| v.is_nan()) { nan_rows += 1; }
 
-        write!(f, "{},{}", lab.symbol, lab.win_start_ms)?;
-        for v in &fv.features {
-            if v.is_nan() { write!(f, ",")?; }           // 空字段 = pandas 的 NaN
-            else          { write!(f, ",{v:.10}")?; }
+            write!(f, "{},{}", lab.symbol, lab.win_start_ms)?;
+            for v in &fv.features {
+                if v.is_nan() { write!(f, ",")?; }           // 空字段 = pandas 的 NaN
+                else          { write!(f, ",{v:.10}")?; }
+            }
+            writeln!(f, ",{},{:.10},{}", lab.label_up, lab.rel_move, lab.near_tie)?;
+            written += 1;
         }
-        writeln!(f, ",{},{:.10},{}", lab.label_up, lab.rel_move, lab.near_tie)?;
-        written += 1;
     }
 
     println!("已写入 {out_path}：{written} 行");

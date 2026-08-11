@@ -19,3 +19,8 @@ __pycache__/
 # Model artifacts (large binaries — track via releases, not git)
 /models/*.onnx
 /models/*.txt
+
+# Python research venv
+.venv/
+__pycache__/
+research/__pycache__/
