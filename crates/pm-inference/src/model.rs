@@ -1,8 +1,17 @@
 //! ONNX 模型加载 + 推理 + isotonic 校准。
 //!
 //! 推理端只依赖两个文件：
-//!   - `model.onnx`          —— train.py 导出的 LightGBM 模型（特征契约）
-//!   - `calibration.json`    —— train.py 拟合的 isotonic 校准器
+//!   - `model.onnx`          —— research/train_*.py 导出的模型（特征契约）
+//!   - `calibration.json`    —— 配套的 isotonic 校准器
+//!
+//! 模型无关性
+//! ----------
+//! 支持两种 ONNX 输出签名，加载时按类型自动判定：
+//!   - `sequence<map<int64,float>>` —— onnxmltools 树模型（LightGBM）的
+//!     ZipMap 输出，每行 `{0: P(down), 1: P(up)}`
+//!   - `tensor<float>[N, 2]` / `[N, 1]` —— PyTorch 等导出的普通张量
+//!     （TCN-LSTM 走这条路）
+//! 换模型时只要 ONNX 输出属于以上任一种，推理端不用改。
 //!
 //! 校准语义必须与训练端完全一致：sklearn 的 IsotonicRegression
 //! (out_of_bounds='clip') 等价于对 (x, y) 阈值表做线性插值，
@@ -12,8 +21,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use ort::session::Session;
-use ort::value::{MapValueType, Tensor};
+use ort::value::{MapValueType, Tensor, TensorElementType, ValueType};
 use serde::Deserialize;
+
+/// ONNX 输出的提取方式 —— 加载时按输出类型判定一次，推理时不再猜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    /// `sequence<map<int64,float>>`：树模型的 ZipMap，取 key=1
+    ZipMap,
+    /// `tensor<float>[N, 2]`：二分类概率张量，取第 1 列
+    Tensor2,
+    /// `tensor<float>[N, 1]`：单列概率张量，直接取
+    Tensor1,
+}
 
 /// isotonic 校准器（对应 train.py 写出的 calibration.json）
 #[derive(Debug, Deserialize)]
@@ -35,6 +55,7 @@ pub struct Model {
     n_features: usize,
     input_name: String,
     output_name: String,
+    output_kind: OutputKind,
 }
 
 /// 一次预测的完整输出
@@ -57,16 +78,16 @@ impl Model {
             .commit_from_file(model_path)
             .with_context(|| format!("加载 ONNX 模型失败: {}", model_path.display()))?;
 
-        // 从 ONNX 图里读输入/输出名 —— 特征契约
+        // 从 ONNX 图里读输入名 —— 特征契约
         let input_name = session.inputs()
             .first()
             .map(|o| o.name().to_owned())
             .context("ONNX 模型没有输入节点")?;
-        let output_name = session.outputs()
-            .iter()
-            .find(|o| o.name() == "probabilities")
-            .map(|o| o.name().to_owned())
-            .context("ONNX 模型缺少 probabilities 输出")?;
+
+        // 输出按「类型」而非名字挑选 —— 不同训练框架的导出器命名不一样
+        // （树模型叫 probabilities，PyTorch 可能叫 output/logits）。
+        // 名字只作为同类型多输出时的优先级提示。
+        let (output_name, output_kind) = Self::pick_output(&session)?;
 
         // 输入特征数（形状 [None, N] 的第二维）。ort 2.0 的 Outlet 不暴露
         // shape，只有 dtype → ValueType::tensor_shape()；动态维度为 -1。
@@ -95,8 +116,57 @@ impl Model {
             "calibration.json 的 x 非单调"
         );
 
-        Ok(Self { session, calib, n_features, input_name, output_name })
+        Ok(Self { session, calib, n_features, input_name, output_name, output_kind })
     }
+
+    /// 在 ONNX 的输出里挑出概率输出，并判定提取方式。
+    ///
+    /// 判定只看类型，不看名字 —— 换模型时导出器命名会变，类型不会：
+    ///   - `sequence<map<..>>`   → ZipMap（树模型）
+    ///   - `tensor<float>[_, 2]` → Tensor2（二分类概率）
+    ///   - `tensor<float>[_, 1]` → Tensor1（单列概率）
+    /// 整数张量（label 输出）直接排除。同类型有多个候选时，名字里带
+    /// prob 的优先，否则取第一个。
+    fn pick_output(session: &Session) -> Result<(String, OutputKind)> {
+        let mut candidates: Vec<(String, OutputKind)> = Vec::new();
+
+        for out in session.outputs().iter() {
+            let kind = match out.dtype() {
+                ValueType::Sequence(inner) if matches!(**inner, ValueType::Map { .. }) => {
+                    Some(OutputKind::ZipMap)
+                }
+                ValueType::Tensor { ty, shape, .. }
+                    if matches!(ty, TensorElementType::Float32 | TensorElementType::Float64)
+                        && matches!(shape.last(), Some(2)) =>
+                {
+                    Some(OutputKind::Tensor2)
+                }
+                ValueType::Tensor { ty, shape, .. }
+                    if matches!(ty, TensorElementType::Float32 | TensorElementType::Float64)
+                        && matches!(shape.last(), Some(1)) =>
+                {
+                    Some(OutputKind::Tensor1)
+                }
+                _ => None,   // label、非浮点张量等一律排除
+            };
+            if let Some(k) = kind {
+                candidates.push((out.name().to_owned(), k));
+            }
+        }
+
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "ONNX 模型没有可用作概率的输出（期望 sequence<map> 或 float 张量 [_,2]/[_,1]）"
+        );
+
+        // 名字含 prob 的优先 —— 多输出模型里更可能是我们要的那个
+        let idx = candidates.iter()
+            .position(|(n, _)| n.to_ascii_lowercase().contains("prob"))
+            .unwrap_or(0);
+        Ok(candidates.swap_remove(idx))
+    }
+
+    pub fn output_kind(&self) -> OutputKind { self.output_kind }
 
     pub fn n_features(&self) -> usize { self.n_features }
 
@@ -122,18 +192,44 @@ impl Model {
         let outputs = self.session.run(ort::inputs![self.input_name.as_str() => input])
             .with_context(|| format!("ONNX 推理失败（输入名: {}）", self.input_name))?;
 
-        // onnxmltools 的 binary 输出是 sequence<map<int64, float>>：
-        // 每个样本一个 dict {0: P(down), 1: P(up)}。输出名定位 probabilities，
-        // 保证不依赖 ONNX 图里的输出顺序（label 可能排在前面）。
+        // 按加载时判定的类型提取 P(UP) —— 树模型走 ZipMap，
+        // PyTorch 等走普通张量，两条路都不依赖输出节点的名字。
         let prob_out = outputs
             .get(&self.output_name)
             .with_context(|| format!("输出缺少 {}", self.output_name))?;
-        let seq = prob_out.try_extract_sequence::<MapValueType<i64, f32>>()
-            .with_context(|| "probabilities 不是 sequence<map<int64, float>>")?;
-        anyhow::ensure!(seq.len() == 1, "probabilities 序列长度异常: {}", seq.len());
-        let map = seq[0].extract_map();   // {0: P(down), 1: P(up)}，类型由 MapValueType<i64, f32> 推断
-        let raw_p = *map.get(&1)
-            .context("probabilities 缺少 key 1 (P(up))")? as f64;
+
+        let raw_p = match self.output_kind {
+            OutputKind::ZipMap => {
+                // onnxmltools 的 binary 输出是 sequence<map<int64, float>>：
+                // 每个样本一个 dict {0: P(down), 1: P(up)}
+                let seq = prob_out.try_extract_sequence::<MapValueType<i64, f32>>()
+                    .with_context(|| "输出不是 sequence<map<int64, float>>")?;
+                anyhow::ensure!(seq.len() == 1, "概率序列长度异常: {}", seq.len());
+                let map = seq[0].extract_map();   // 类型由 MapValueType<i64, f32> 推断
+                *map.get(&1).context("概率 map 缺少 key 1 (P(up))")? as f64
+            }
+            OutputKind::Tensor2 => {
+                // [1, 2] = [P(down), P(up)]
+                let (_, data) = prob_out.try_extract_tensor::<f32>()
+                    .with_context(|| "输出不是 float 张量")?;
+                anyhow::ensure!(data.len() == 2, "概率张量长度异常: {}（期望 2）", data.len());
+                data[1] as f64
+            }
+            OutputKind::Tensor1 => {
+                // [1, 1] = [P(up)]
+                let (_, data) = prob_out.try_extract_tensor::<f32>()
+                    .with_context(|| "输出不是 float 张量")?;
+                anyhow::ensure!(data.len() == 1, "概率张量长度异常: {}（期望 1）", data.len());
+                data[0] as f64
+            }
+        };
+
+        // 概率必须落在 [0,1] —— 越界说明模型导出时漏了 sigmoid/softmax，
+        // 直接报错好过把 logits 当概率喂给校准器。
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&raw_p),
+            "模型输出 {raw_p} 不在 [0,1]，可能导出时漏了 sigmoid/softmax"
+        );
 
         Ok(Prediction {
             raw_p,
@@ -243,6 +339,21 @@ mod tests {
         assert!((isotonic_clip(0.5, &c) - 0.4).abs() < 1e-12);
         // 0.4 在 (0.3,0.2)-(0.5,0.4) 之间 → 0.3
         assert!((isotonic_clip(0.4, &c) - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zipmap_model_kind_is_detected() {
+        // verify_onnx 在 Python 端确认 LightGBM 导出是 sequence<map>，
+        // 这里用 synth 模型验证 Rust 端对 ZipMap 的自动判定。
+        if !Path::new("/tmp/synth_model.onnx").exists() {
+            eprintln!("跳过：缺少 /tmp/synth_model.onnx（先运行 research/synth/gen_synth_model.py）");
+            return;
+        }
+        let session = Session::builder().unwrap()
+            .commit_from_file("/tmp/synth_model.onnx").unwrap();
+        let (name, kind) = Model::pick_output(&session).unwrap();
+        assert_eq!(kind, OutputKind::ZipMap, "LightGBM 输出应为 ZipMap，实际 {kind:?} ({name})");
+        assert_eq!(name, "probabilities");
     }
 
     #[test]
