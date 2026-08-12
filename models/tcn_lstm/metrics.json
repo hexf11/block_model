@@ -1,0 +1,161 @@
+{
+  "model": "tcn_lstm",
+  "feature_cols": [
+    "ret_so_far",
+    "price_position",
+    "spot_ret_from_open",
+    "twap_norm_dist",
+    "spot_norm_dist",
+    "basis_dev",
+    "basis_dev_z",
+    "basis_slope_30s",
+    "basis_slope_60s",
+    "twap_spot_gap_norm",
+    "ofi_10s",
+    "ofi_30s",
+    "ofi_60s",
+    "ofi_agreement",
+    "flow_imb_30s",
+    "flow_imb_60s",
+    "large_flow_imb_60s",
+    "vwap_dev",
+    "slope_all",
+    "slope_recent",
+    "slope_ratio",
+    "ret_30s",
+    "spot_slope_30s",
+    "rel_vol",
+    "vol_ratio",
+    "spot_vol_rel",
+    "rel_spread",
+    "xex_dispersion",
+    "tick_density",
+    "staleness_s",
+    "n_exchanges",
+    "log_trades_30s",
+    "symbol_id"
+  ],
+  "train": {
+    "name": "train",
+    "n": 135,
+    "up_rate": 0.43703705072402954,
+    "brier": 0.31467967215965154,
+    "logloss": 7.7742628002220755,
+    "acc": 0.6222222222222222,
+    "auc": 0.6774085637823372,
+    "ece": 0.29682139069400404
+  },
+  "val": {
+    "name": "val",
+    "n": 31,
+    "up_rate": 0.5806451439857483,
+    "brier": 0.1811665037471489,
+    "logloss": 0.5055257521775354,
+    "acc": 0.6774193548387096,
+    "auc": 0.7606837606837606,
+    "ece": 1.4420478596179468e-08
+  },
+  "test": {
+    "name": "test",
+    "n": 31,
+    "up_rate": 0.35483869910240173,
+    "brier": 0.5280195533758668,
+    "logloss": 15.413477464488219,
+    "acc": 0.3548387096774194,
+    "auc": 0.38863636363636367,
+    "ece": 0.45586483231563796
+  },
+  "symbols": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "n_windows": 212,
+  "time_range_ms": [
+    1786399800000,
+    1786416900000
+  ],
+  "split": {
+    "train": 150,
+    "val": 31,
+    "test": 31
+  },
+  "sequence_split": {
+    "train": 135,
+    "val": 31,
+    "test": 31
+  },
+  "calibration": {
+    "method": "isotonic_clip",
+    "x": [
+      0.47738391160964966,
+      0.47741249203681946,
+      0.4774194359779358,
+      0.47971010208129883,
+      0.4797774851322174,
+      0.480442076921463,
+      0.48094308376312256,
+      0.4809839129447937,
+      0.48099687695503235,
+      0.483869343996048
+    ],
+    "y": [
+      0.0,
+      0.0,
+      0.45454545454545453,
+      0.45454545454545453,
+      0.5555555555555556,
+      0.5555555555555556,
+      0.6666666666666666,
+      0.6666666666666666,
+      1.0,
+      1.0
+    ],
+    "raw_min": 0.47738391160964966,
+    "raw_max": 0.483869343996048,
+    "n": 31,
+    "degenerate": false
+  },
+  "seq_len": 16,
+  "architecture": "tcn_lstm",
+  "onnx": {
+    "input_names": [
+      "seq_val",
+      "seq_mask",
+      "seq_id"
+    ],
+    "input_shapes": [
+      [
+        "batch",
+        16,
+        32
+      ],
+      [
+        "batch",
+        16,
+        32
+      ],
+      [
+        "batch",
+        16
+      ]
+    ],
+    "output_name": "probabilities",
+    "output_type": "tensor(float)",
+    "extract": "tensor",
+    "max_abs_diff": 2.9802322387695312e-08
+  },
+  "params": {
+    "n_kernels": 32,
+    "kernel": 3,
+    "lstm_hidden": 32,
+    "hidden": 64,
+    "embed_dim": 8,
+    "dropout": 0.3,
+    "lr": 0.001,
+    "n_epochs": 15,
+    "batch": 32
+  }
+}

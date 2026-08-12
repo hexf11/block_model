@@ -17,8 +17,18 @@ __pycache__/
 *.log
 
 # Model artifacts (large binaries — track via releases, not git)
+# 规则要覆盖子目录：产物现在按模型分目录放 models/{lightgbm,tcn_lstm}/
+/models/**/*.onnx
+/models/**/*.onnx.data
+/models/**/*.txt
+/models/**/*.png
 /models/*.onnx
 /models/*.txt
+# metrics.json / calibration.json 例外：小文本，是 compare.py 的对比依据
+# 和推理端的校准契约，值得进版本库
+
+# CatBoost 训练残留（未使用该模型，此目录是误跑留下的）
+/catboost_info/
 
 # Python research venv
 .venv/

@@ -1,0 +1,123 @@
+{
+  "model": "lightgbm",
+  "feature_cols": [
+    "ret_so_far",
+    "price_position",
+    "spot_ret_from_open",
+    "twap_norm_dist",
+    "spot_norm_dist",
+    "basis_dev",
+    "basis_dev_z",
+    "basis_slope_30s",
+    "basis_slope_60s",
+    "twap_spot_gap_norm",
+    "ofi_10s",
+    "ofi_30s",
+    "ofi_60s",
+    "ofi_agreement",
+    "flow_imb_30s",
+    "flow_imb_60s",
+    "large_flow_imb_60s",
+    "vwap_dev",
+    "slope_all",
+    "slope_recent",
+    "slope_ratio",
+    "ret_30s",
+    "spot_slope_30s",
+    "rel_vol",
+    "vol_ratio",
+    "spot_vol_rel",
+    "rel_spread",
+    "xex_dispersion",
+    "tick_density",
+    "staleness_s",
+    "n_exchanges",
+    "log_trades_30s",
+    "symbol_id"
+  ],
+  "train": {
+    "name": "train",
+    "n": 150,
+    "up_rate": 0.48,
+    "brier": 0.25972944849115503,
+    "logloss": 0.7128350948149883,
+    "acc": 0.48,
+    "auc": 0.5,
+    "ece": 0.10064516129032253
+  },
+  "val": {
+    "name": "val",
+    "n": 31,
+    "up_rate": 0.5806451612903226,
+    "brier": 0.2434963579604579,
+    "logloss": 0.6800829048357608,
+    "acc": 0.5806451612903226,
+    "auc": 0.5,
+    "ece": 1.1102230246251565e-16
+  },
+  "test": {
+    "name": "test",
+    "n": 31,
+    "up_rate": 0.3548387096774194,
+    "brier": 0.2799167533818938,
+    "logloss": 0.7535653823532575,
+    "acc": 0.3548387096774194,
+    "auc": 0.5,
+    "ece": 0.22580645161290336
+  },
+  "symbols": [
+    "btc/usd",
+    "doge/usd",
+    "eth/usd",
+    "sol/usd",
+    "xrp/usd"
+  ],
+  "n_windows": 212,
+  "time_range_ms": [
+    1786399800000,
+    1786416900000
+  ],
+  "split": {
+    "train": 150,
+    "val": 31,
+    "test": 31
+  },
+  "calibration": {
+    "method": "isotonic_clip",
+    "x": [
+      0.48
+    ],
+    "y": [
+      0.5806451612903226
+    ],
+    "raw_min": 0.48,
+    "raw_max": 0.48,
+    "n": 31,
+    "degenerate": true
+  },
+  "onnx": {
+    "input_name": "input",
+    "input_shape": [
+      "None",
+      33
+    ],
+    "output_name": "probabilities",
+    "output_type": "seq(map(int64,tensor(float)))",
+    "extract": "zipmap",
+    "max_abs_diff": 4.0531158429502057e-08
+  },
+  "params": {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_data_in_leaf": 100,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "verbosity": -1,
+    "seed": 42
+  },
+  "best_iteration": 1
+}

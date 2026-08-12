@@ -1,0 +1,13 @@
+{
+  "method": "isotonic_clip",
+  "x": [
+    0.48
+  ],
+  "y": [
+    0.5806451612903226
+  ],
+  "raw_min": 0.48,
+  "raw_max": 0.48,
+  "n": 31,
+  "degenerate": true
+}

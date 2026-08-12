@@ -13,9 +13,17 @@ shap==0.46.0
 onnxmltools==1.12.0
 skl2onnx==1.18.0
 onnx==1.17.0
-# onnxruntime：验证 ONNX 输出 == LightGBM 预测（推理端用 ort）
+# onnxruntime：验证 ONNX 输出 == 训练框架预测（推理端用 ort）
 # Python 3.14 需要 >=1.24（1.21 系列只支持 <3.13）
-onnxruntime==1.24.1
+onnxruntime==1.28.0
+
+# ── TCN-LSTM（train_tcn_lstm.py）────────────────────────────────────────────
+torch==2.13.0
+# torch.onnx.export 的默认（dynamo）导出器需要 onnxscript。
+# 注意 train_tcn_lstm.py 实际走的是 legacy 导出器（dynamo=False）——
+# 默认导出器对双向 LSTM 会生成错误的 Reshape，onnxruntime 跑不起来。
+# 仍然装它：不装的话 torch.onnx.export 连 import 都过不去。
+onnxscript==0.7.1
 
 # onnxmltools 是 2022 年的包，import 时依赖 pkg_resources；
 # Python 3.12+ 自带 setuptools 已移除它，必须锁旧版
